@@ -10,6 +10,7 @@ use chrono::Utc;
 use crate::cvat_api;
 use crate::db;
 use crate::embedding::projection::deterministic_projection;
+use crate::embedding::runtime::{probe_runtime, RuntimeBackend};
 use crate::models::{
     AddSourceFolderInput, AnnotationVersion, BrowserPayload, CreateWorkspaceInput,
     CreateCvatTaskInput, CvatSettings, CvatTask, DatasetMapPayload, DatasetMapPayloadInput,
@@ -346,37 +347,33 @@ fn default_embedding_models() -> Vec<EmbeddingModelOption> {
 }
 
 fn default_embedding_runtime_probe(preference: &str) -> EmbeddingRuntimeProbe {
-    let fallback_reason = if preference == "cpu" {
-        None
-    } else {
-        Some("Using CPU until ONNX Runtime provider probing is wired.".to_string())
-    };
+    let probe = probe_runtime(preference);
 
     EmbeddingRuntimeProbe {
         preference: preference.to_string(),
-        selected_backend: "cpu".to_string(),
+        selected_backend: probe.selected_backend.as_str().to_string(),
         capabilities: vec![
             EmbeddingRuntimeCapability {
-                backend: "cuda".to_string(),
+                backend: RuntimeBackend::Cuda.as_str().to_string(),
                 available: false,
                 label: "NVIDIA CUDA".to_string(),
                 detail: "No CUDA provider detected in the current backend build.".to_string(),
             },
             EmbeddingRuntimeCapability {
-                backend: "windows-gpu".to_string(),
+                backend: RuntimeBackend::WindowsGpu.as_str().to_string(),
                 available: false,
                 label: "Windows GPU".to_string(),
                 detail: "DirectML provider detection will be added with packaged runtime support."
                     .to_string(),
             },
             EmbeddingRuntimeCapability {
-                backend: "cpu".to_string(),
+                backend: RuntimeBackend::Cpu.as_str().to_string(),
                 available: true,
                 label: "CPU".to_string(),
                 detail: "Available on this Windows desktop build.".to_string(),
             },
         ],
-        fallback_reason,
+        fallback_reason: probe.fallback_reason,
     }
 }
 
