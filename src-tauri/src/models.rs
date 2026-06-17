@@ -406,3 +406,129 @@ pub struct StartExportResult {
     pub exported_images: u32,
     pub exported_boxes: u32,
 }
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingModelOption {
+    pub id: String,
+    pub family: String,
+    pub display_name: String,
+    pub embedding_dim: u32,
+    pub input_size: u32,
+    pub available: bool,
+    pub download_required: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingRuntimeCapability {
+    pub backend: String,
+    pub available: bool,
+    pub label: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingRuntimeProbe {
+    pub preference: String,
+    pub selected_backend: String,
+    pub capabilities: Vec<EmbeddingRuntimeCapability>,
+    pub fallback_reason: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetMapBbox {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub area_ratio: Option<f64>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetMapPoint {
+    pub id: String,
+    pub scope: String,
+    pub image_id: String,
+    pub annotation_id: Option<String>,
+    pub filename: String,
+    pub source_id: String,
+    pub source_name: String,
+    pub category_id: Option<String>,
+    pub category_name: Option<String>,
+    pub bbox: Option<DatasetMapBbox>,
+    pub x: f64,
+    pub y: f64,
+    pub review_status: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingJob {
+    pub id: String,
+    pub scope: String,
+    pub model_id: String,
+    pub runtime_preference: String,
+    pub runtime_backend: Option<String>,
+    pub status: String,
+    pub processed_items: u32,
+    pub total_items: u32,
+    pub message: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetMapPayload {
+    pub workspace_id: String,
+    pub scope: String,
+    pub model_id: String,
+    pub models: Vec<EmbeddingModelOption>,
+    pub runtime: EmbeddingRuntimeProbe,
+    pub points: Vec<DatasetMapPoint>,
+    pub jobs: Vec<EmbeddingJob>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetMapPayloadInput {
+    pub workspace_id: String,
+    pub scope: String,
+    pub model_id: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingRuntimeProbeInput {
+    pub workspace_id: String,
+    pub preference: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingJobInput {
+    pub workspace_id: String,
+    pub scope: String,
+    pub model_id: String,
+    pub runtime_preference: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetReviewUpdate {
+    pub target_id: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetMapReviewInput {
+    pub workspace_id: String,
+    pub scope: String,
+    pub updates: Vec<DatasetReviewUpdate>,
+}

@@ -11,10 +11,13 @@ use crate::cvat_api;
 use crate::db;
 use crate::models::{
     AddSourceFolderInput, AnnotationVersion, BrowserPayload, CreateWorkspaceInput,
-    CreateCvatTaskInput, CvatSettings, CvatTask, ExportHistoryEntry, ExportImageRecord,
-    ExportPreviewInput, ImageDetailPayload, ImportReviewRow, OpenCvatInput, OpenWorkspaceInput,
-    RecentWorkspace, RemoveSourceFolderInput, RescanSourceFolderInput, SaveImportReviewInput,
-    ScanProgress, SourceFolder, StartExportInput, StartExportResult,
+    CreateCvatTaskInput, CvatSettings, CvatTask, DatasetMapPayload, DatasetMapPayloadInput,
+    DatasetMapReviewInput, DatasetReviewUpdate, EmbeddingJob, EmbeddingJobInput,
+    EmbeddingModelOption, EmbeddingRuntimeCapability, EmbeddingRuntimeProbe,
+    EmbeddingRuntimeProbeInput, ExportHistoryEntry, ExportImageRecord, ExportPreviewInput,
+    ImageDetailPayload, ImportReviewRow, OpenCvatInput, OpenWorkspaceInput, RecentWorkspace,
+    RemoveSourceFolderInput, RescanSourceFolderInput, SaveImportReviewInput, ScanProgress,
+    SourceFolder, StartExportInput, StartExportResult,
     StoredAnnotationRecord, StoredCategoryRecord, StoredImageRecord,
     SyncCvatTaskInput, WorkspaceCreateTargetCheck, WorkspaceManifest, WorkspaceOverview,
 };
@@ -244,6 +247,112 @@ pub fn load_image_detail_by_id(
 ) -> Result<ImageDetailPayload, String> {
     let paths = resolve_workspace_paths_by_id(workspace_id)?;
     db::read_image_detail(&paths.db_path, image_id)
+}
+
+pub fn load_dataset_map_payload_by_id(
+    input: DatasetMapPayloadInput,
+) -> Result<DatasetMapPayload, String> {
+    let models = default_embedding_models();
+    let model_id = input
+        .model_id
+        .clone()
+        .filter(|id| models.iter().any(|model| model.id == *id))
+        .unwrap_or_else(|| "clip-vit-b32".to_string());
+
+    Ok(DatasetMapPayload {
+        workspace_id: input.workspace_id,
+        scope: input.scope,
+        model_id,
+        models,
+        runtime: default_embedding_runtime_probe("auto"),
+        points: vec![],
+        jobs: vec![],
+    })
+}
+
+pub fn probe_embedding_runtime_by_id(
+    input: EmbeddingRuntimeProbeInput,
+) -> Result<EmbeddingRuntimeProbe, String> {
+    Ok(default_embedding_runtime_probe(&input.preference))
+}
+
+pub fn start_embedding_job_by_id(input: EmbeddingJobInput) -> Result<EmbeddingJob, String> {
+    Ok(EmbeddingJob {
+        id: format!("embedding-job-{}", Utc::now().timestamp_millis()),
+        scope: input.scope,
+        model_id: input.model_id,
+        runtime_preference: input.runtime_preference,
+        runtime_backend: Some("cpu".to_string()),
+        status: "completed".to_string(),
+        processed_items: 0,
+        total_items: 0,
+        message: Some("Embedding runtime commands are registered; storage/runtime execution will be wired in the next task.".to_string()),
+        updated_at: Utc::now().to_rfc3339(),
+    })
+}
+
+pub fn save_dataset_map_reviews_by_id(
+    input: DatasetMapReviewInput,
+) -> Result<Vec<DatasetReviewUpdate>, String> {
+    Ok(input.updates)
+}
+
+fn default_embedding_models() -> Vec<EmbeddingModelOption> {
+    vec![
+        EmbeddingModelOption {
+            id: "clip-vit-b32".to_string(),
+            family: "clip".to_string(),
+            display_name: "CLIP ViT-B/32".to_string(),
+            embedding_dim: 512,
+            input_size: 224,
+            available: true,
+            download_required: false,
+        },
+        EmbeddingModelOption {
+            id: "dinov2-small".to_string(),
+            family: "dinov2".to_string(),
+            display_name: "DINOv2 Small".to_string(),
+            embedding_dim: 384,
+            input_size: 224,
+            available: true,
+            download_required: false,
+        },
+    ]
+}
+
+fn default_embedding_runtime_probe(preference: &str) -> EmbeddingRuntimeProbe {
+    let fallback_reason = if preference == "cpu" {
+        None
+    } else {
+        Some("Using CPU until ONNX Runtime provider probing is wired.".to_string())
+    };
+
+    EmbeddingRuntimeProbe {
+        preference: preference.to_string(),
+        selected_backend: "cpu".to_string(),
+        capabilities: vec![
+            EmbeddingRuntimeCapability {
+                backend: "cuda".to_string(),
+                available: false,
+                label: "NVIDIA CUDA".to_string(),
+                detail: "No CUDA provider detected in the current backend build.".to_string(),
+            },
+            EmbeddingRuntimeCapability {
+                backend: "windows-gpu".to_string(),
+                available: false,
+                label: "Windows GPU".to_string(),
+                detail: "DirectML provider detection will be added with packaged runtime support."
+                    .to_string(),
+            },
+            EmbeddingRuntimeCapability {
+                backend: "cpu".to_string(),
+                available: true,
+                label: "CPU".to_string(),
+                detail: "Available on this Windows desktop build.".to_string(),
+            },
+        ],
+        fallback_reason,
+    }
 }
 
 pub fn load_export_preview_by_id(input: ExportPreviewInput) -> Result<crate::models::ExportPreview, String> {
