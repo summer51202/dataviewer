@@ -309,6 +309,16 @@ pub fn start_embedding_job_by_id(input: EmbeddingJobInput) -> Result<EmbeddingJo
 pub fn save_dataset_map_reviews_by_id(
     input: DatasetMapReviewInput,
 ) -> Result<Vec<DatasetReviewUpdate>, String> {
+    let paths = resolve_workspace_paths_by_id(&input.workspace_id)?;
+    let updated_at = Utc::now().to_rfc3339();
+    db::upsert_dataset_review_marks(
+        &paths.db_path,
+        &input.workspace_id,
+        &input.scope,
+        &input.updates,
+        &updated_at,
+    )?;
+
     Ok(input.updates)
 }
 

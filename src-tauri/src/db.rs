@@ -5,7 +5,7 @@ use rusqlite::{params, Connection};
 
 use crate::models::{
     AnnotationVersion, BoundingBoxRecord, BoxSummary, BrowserPayload, DatasetMapBbox,
-    DatasetMapPoint, ExportAnnotationRecord, ExportConflictItem,
+    DatasetMapPoint, DatasetReviewUpdate, ExportAnnotationRecord, ExportConflictItem,
     ExportFilenameConflict, ExportHistoryEntry, ExportImageRecord, ImageCard,
     ImageDetailPayload, ImportReviewRow, SourceFolder, StoredAnnotationRecord,
     StoredCategoryRecord, StoredImageRecord, StoredSourceFolder, UnifiedCategory,
@@ -850,6 +850,63 @@ pub fn upsert_embedding_projections(
     transaction
         .commit()
         .map_err(|error| format!("failed to commit embedding projection transaction: {error}"))?;
+
+    Ok(())
+}
+
+pub fn upsert_dataset_review_marks(
+    db_path: &Path,
+    workspace_id: &str,
+    scope: &str,
+    updates: &[DatasetReviewUpdate],
+    updated_at: &str,
+) -> Result<(), String> {
+    let mut connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("failed to start dataset review mark transaction: {error}"))?;
+
+    for update in updates {
+        transaction
+            .execute(
+                r#"
+                INSERT INTO dataset_review_marks (
+                    id,
+                    workspace_id,
+                    scope,
+                    target_id,
+                    status,
+                    reason,
+                    note,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+                ON CONFLICT(workspace_id, scope, target_id)
+                DO UPDATE SET
+                    status = excluded.status,
+                    reason = excluded.reason,
+                    note = excluded.note,
+                    updated_at = excluded.updated_at
+                "#,
+                params![
+                    format!("review-{workspace_id}-{scope}-{}", update.target_id),
+                    workspace_id,
+                    scope,
+                    &update.target_id,
+                    &update.status,
+                    update.reason.as_deref(),
+                    update.note.as_deref(),
+                    updated_at,
+                ],
+            )
+            .map_err(|error| format!("failed to upsert dataset review mark: {error}"))?;
+    }
+
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit dataset review mark transaction: {error}"))?;
 
     Ok(())
 }
@@ -2622,6 +2679,75 @@ mod tests {
         assert_eq!(points[0].category_name.as_deref(), Some("screw"));
         assert_eq!(points[0].review_status, "unreviewed");
         assert_eq!(points[0].bbox.as_ref().and_then(|bbox| bbox.area_ratio), Some(0.04));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn upsert_dataset_review_marks_updates_existing_mark() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("dataviewer-review-marks-{timestamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("workspace.db");
+        initialize_database(&db_path).unwrap();
+
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspace_meta (id, name, workspace_path, created_at, updated_at, app_version) VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+                params!["ws-1", "Workspace", "D:\\workspace", "2026-06-17T00:00:00Z", APP_VERSION],
+            )
+            .unwrap();
+
+        upsert_dataset_review_marks(
+            &db_path,
+            "ws-1",
+            "object",
+            &[DatasetReviewUpdate {
+                target_id: "ann-1".into(),
+                status: "needs-review".into(),
+                reason: None,
+                note: None,
+            }],
+            "2026-06-17T00:00:00Z",
+        )
+        .unwrap();
+        upsert_dataset_review_marks(
+            &db_path,
+            "ws-1",
+            "object",
+            &[DatasetReviewUpdate {
+                target_id: "ann-1".into(),
+                status: "exclude".into(),
+                reason: Some("bad crop".into()),
+                note: Some("too blurry".into()),
+            }],
+            "2026-06-17T00:01:00Z",
+        )
+        .unwrap();
+
+        let row = connection
+            .query_row(
+                "SELECT status, reason, note, updated_at FROM dataset_review_marks WHERE workspace_id = ?1 AND scope = ?2 AND target_id = ?3",
+                params!["ws-1", "object", "ann-1"],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(row.0, "exclude");
+        assert_eq!(row.1.as_deref(), Some("bad crop"));
+        assert_eq!(row.2.as_deref(), Some("too blurry"));
+        assert_eq!(row.3, "2026-06-17T00:01:00Z");
 
         let _ = std::fs::remove_dir_all(root);
     }
