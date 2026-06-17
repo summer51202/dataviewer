@@ -156,7 +156,7 @@ export const sampleBrowserPayload: BrowserPayload = {
       boxSummaries: [
         { categoryName: "screw", areaRatio: 0.057 },
         { categoryName: "nut", areaRatio: 0.031 },
-        { categoryName: "nut", areaRatio: 0.029 },
+        { categoryName: "nut", areaRatio: 0.019 },
       ],
       categoryIds: ["cat-screw", "cat-nut"],
       categories: ["screw", "nut"],
@@ -455,7 +455,7 @@ export const sampleDatasetMapPayload: DatasetMapPayload = {
       sourceName: "coco_old",
       categoryId: "cat-nut",
       categoryName: "nut",
-      bbox: { x: 930, y: 118, width: 132, height: 132, areaRatio: 0.029 },
+      bbox: { x: 930, y: 118, width: 132, height: 132, areaRatio: 0.019 },
       x: -0.05,
       y: 0.53,
       reviewStatus: "fix",
