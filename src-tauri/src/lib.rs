@@ -1,6 +1,7 @@
 mod commands;
 mod cvat_api;
 mod db;
+mod embedding;
 mod mock;
 mod models;
 mod paths;

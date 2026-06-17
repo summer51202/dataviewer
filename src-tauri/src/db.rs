@@ -13,6 +13,22 @@ use crate::models::{
 };
 use crate::paths::APP_VERSION;
 
+pub struct DatasetMapProjectionTarget {
+    pub target_id: String,
+}
+
+pub struct EmbeddingProjectionRow {
+    pub id: String,
+    pub workspace_id: String,
+    pub scope: String,
+    pub target_id: String,
+    pub model_id: String,
+    pub projection_method: String,
+    pub x: f64,
+    pub y: f64,
+    pub created_at: String,
+}
+
 const INIT_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS workspace_meta (
     id TEXT PRIMARY KEY,
@@ -729,6 +745,113 @@ pub fn read_dataset_map_points(
     }
 
     Ok(points)
+}
+
+pub fn read_dataset_map_projection_targets(
+    db_path: &Path,
+    workspace_id: &str,
+    scope: &str,
+) -> Result<Vec<DatasetMapProjectionTarget>, String> {
+    let connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+
+    let sql = match scope {
+        "object" => {
+            r#"
+            SELECT a.id
+            FROM annotations a
+            INNER JOIN images i ON i.id = a.image_id
+            WHERE a.workspace_id = ?1
+            ORDER BY i.file_name ASC, a.id ASC
+            "#
+        }
+        "image" => {
+            r#"
+            SELECT i.id
+            FROM images i
+            WHERE i.workspace_id = ?1
+                AND EXISTS (
+                    SELECT 1
+                    FROM annotations a
+                    WHERE a.image_id = i.id
+                )
+            ORDER BY i.file_name ASC, i.id ASC
+            "#
+        }
+        other => return Err(format!("unsupported dataset map scope '{other}'")),
+    };
+
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|error| format!("failed to prepare dataset map projection target query: {error}"))?;
+    let rows = statement
+        .query_map(params![workspace_id], |row| {
+            Ok(DatasetMapProjectionTarget {
+                target_id: row.get(0)?,
+            })
+        })
+        .map_err(|error| format!("failed to read dataset map projection targets: {error}"))?;
+
+    let mut targets = Vec::new();
+    for row in rows {
+        targets.push(row.map_err(|error| format!("failed to map dataset map projection target: {error}"))?);
+    }
+
+    Ok(targets)
+}
+
+pub fn upsert_embedding_projections(
+    db_path: &Path,
+    projections: &[EmbeddingProjectionRow],
+) -> Result<(), String> {
+    let mut connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("failed to start embedding projection transaction: {error}"))?;
+
+    for projection in projections {
+        transaction
+            .execute(
+                r#"
+                INSERT INTO embedding_projections (
+                    id,
+                    workspace_id,
+                    scope,
+                    target_id,
+                    model_id,
+                    projection_method,
+                    x,
+                    y,
+                    created_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(workspace_id, scope, target_id, model_id, projection_method)
+                DO UPDATE SET
+                    x = excluded.x,
+                    y = excluded.y,
+                    created_at = excluded.created_at
+                "#,
+                params![
+                    projection.id,
+                    projection.workspace_id,
+                    projection.scope,
+                    projection.target_id,
+                    projection.model_id,
+                    projection.projection_method,
+                    projection.x,
+                    projection.y,
+                    projection.created_at,
+                ],
+            )
+            .map_err(|error| format!("failed to upsert embedding projection: {error}"))?;
+    }
+
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit embedding projection transaction: {error}"))?;
+
+    Ok(())
 }
 
 pub fn read_import_review_rows(db_path: &Path) -> Result<Vec<ImportReviewRow>, String> {
@@ -2427,6 +2550,78 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "missing table {table_name}");
         }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn upsert_embedding_projections_can_feed_dataset_map_points() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("dataviewer-map-points-{timestamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("workspace.db");
+        initialize_database(&db_path).unwrap();
+
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspace_meta (id, name, workspace_path, created_at, updated_at, app_version) VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+                params!["ws-1", "Workspace", "D:\\workspace", "2026-06-17T00:00:00Z", APP_VERSION],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO source_folders (id, workspace_id, path, source_type, status, last_scan_at, image_count, category_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params!["source-1", "ws-1", "D:\\datasets\\source-1", "COCO", "ready", "2026-06-17T00:00:00Z", 1, 1],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images (id, workspace_id, source_id, file_name, original_path, width, height, annotation_status, health_status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                params!["image-1", "ws-1", "source-1", "frame.jpg", "D:\\datasets\\source-1\\frame.jpg", 100, 50, "annotated", "healthy", "2026-06-17T00:00:00Z"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO categories (id, workspace_id, source_id, name, normalized_name, category_role, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                params!["cat-1", "ws-1", "source-1", "screw", "screw", "source", "2026-06-17T00:00:00Z"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO annotations (id, workspace_id, image_id, source_id, source_category_id, bbox_x, bbox_y, bbox_width, bbox_height, annotation_format, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                params!["ann-1", "ws-1", "image-1", "source-1", "cat-1", 10.0, 5.0, 20.0, 10.0, "coco", "2026-06-17T00:00:00Z"],
+            )
+            .unwrap();
+
+        upsert_embedding_projections(
+            &db_path,
+            &[EmbeddingProjectionRow {
+                id: "projection-1".into(),
+                workspace_id: "ws-1".into(),
+                scope: "object".into(),
+                target_id: "ann-1".into(),
+                model_id: "clip-vit-b32".into(),
+                projection_method: "bootstrap-deterministic".into(),
+                x: 0.25,
+                y: -0.5,
+                created_at: "2026-06-17T00:00:00Z".into(),
+            }],
+        )
+        .unwrap();
+
+        let points =
+            read_dataset_map_points(&db_path, "ws-1", "object", "clip-vit-b32").unwrap();
+
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].id, "ann-1");
+        assert_eq!(points[0].image_id, "image-1");
+        assert_eq!(points[0].category_name.as_deref(), Some("screw"));
+        assert_eq!(points[0].review_status, "unreviewed");
+        assert_eq!(points[0].bbox.as_ref().and_then(|bbox| bbox.area_ratio), Some(0.04));
 
         let _ = std::fs::remove_dir_all(root);
     }

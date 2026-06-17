@@ -9,6 +9,7 @@ use chrono::Utc;
 
 use crate::cvat_api;
 use crate::db;
+use crate::embedding::projection::deterministic_projection;
 use crate::models::{
     AddSourceFolderInput, AnnotationVersion, BrowserPayload, CreateWorkspaceInput,
     CreateCvatTaskInput, CvatSettings, CvatTask, DatasetMapPayload, DatasetMapPayloadInput,
@@ -281,6 +282,14 @@ pub fn probe_embedding_runtime_by_id(
 }
 
 pub fn start_embedding_job_by_id(input: EmbeddingJobInput) -> Result<EmbeddingJob, String> {
+    let paths = resolve_workspace_paths_by_id(&input.workspace_id)?;
+    let processed_items = generate_bootstrap_embedding_projections(
+        &paths.db_path,
+        &input.workspace_id,
+        &input.scope,
+        &input.model_id,
+    )?;
+
     Ok(EmbeddingJob {
         id: format!("embedding-job-{}", Utc::now().timestamp_millis()),
         scope: input.scope,
@@ -288,9 +297,11 @@ pub fn start_embedding_job_by_id(input: EmbeddingJobInput) -> Result<EmbeddingJo
         runtime_preference: input.runtime_preference,
         runtime_backend: Some("cpu".to_string()),
         status: "completed".to_string(),
-        processed_items: 0,
-        total_items: 0,
-        message: Some("Embedding runtime commands are registered; storage/runtime execution will be wired in the next task.".to_string()),
+        processed_items,
+        total_items: processed_items,
+        message: Some(format!(
+            "Generated deterministic bootstrap projections for {processed_items} items."
+        )),
         updated_at: Utc::now().to_rfc3339(),
     })
 }
@@ -357,6 +368,41 @@ fn default_embedding_runtime_probe(preference: &str) -> EmbeddingRuntimeProbe {
         ],
         fallback_reason,
     }
+}
+
+fn generate_bootstrap_embedding_projections(
+    db_path: &Path,
+    workspace_id: &str,
+    scope: &str,
+    model_id: &str,
+) -> Result<u32, String> {
+    let targets = db::read_dataset_map_projection_targets(db_path, workspace_id, scope)?;
+    let now = Utc::now().to_rfc3339();
+    let projections = targets
+        .iter()
+        .map(|target| {
+            let seed = format!("{scope}:{model_id}:{}", target.target_id);
+            let (x, y) = deterministic_projection(&seed);
+            db::EmbeddingProjectionRow {
+                id: format!(
+                    "projection-{workspace_id}-{scope}-{model_id}-{}-bootstrap",
+                    target.target_id
+                ),
+                workspace_id: workspace_id.to_string(),
+                scope: scope.to_string(),
+                target_id: target.target_id.clone(),
+                model_id: model_id.to_string(),
+                projection_method: "bootstrap-deterministic".to_string(),
+                x,
+                y,
+                created_at: now.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    db::upsert_embedding_projections(db_path, &projections)?;
+
+    Ok(projections.len() as u32)
 }
 
 pub fn load_export_preview_by_id(input: ExportPreviewInput) -> Result<crate::models::ExportPreview, String> {
