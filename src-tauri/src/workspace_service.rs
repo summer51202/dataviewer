@@ -10,7 +10,10 @@ use chrono::Utc;
 use crate::cvat_api;
 use crate::db;
 use crate::embedding::projection::deterministic_projection;
-use crate::embedding::runtime::{probe_runtime, RuntimeBackend};
+use crate::embedding::providers::smoke_test_session;
+use crate::embedding::runtime::{
+    default_model_registry, probe_runtime, resolve_model_asset, RuntimeBackend,
+};
 use crate::models::{
     AddSourceFolderInput, AnnotationVersion, BrowserPayload, CreateWorkspaceInput,
     CreateCvatTaskInput, CvatSettings, CvatTask, DatasetMapPayload, DatasetMapPayloadInput,
@@ -254,15 +257,15 @@ pub fn load_image_detail_by_id(
 pub fn load_dataset_map_payload_by_id(
     input: DatasetMapPayloadInput,
 ) -> Result<DatasetMapPayload, String> {
-    let models = default_embedding_models();
+    let workspace_id = input.workspace_id.clone();
+    let scope = input.scope.clone();
+    let paths = resolve_workspace_paths_by_id(&workspace_id)?;
+    let models = default_embedding_models(&paths.root);
     let model_id = input
         .model_id
         .clone()
         .filter(|id| models.iter().any(|model| model.id == *id))
         .unwrap_or_else(|| "clip-vit-b32".to_string());
-    let workspace_id = input.workspace_id.clone();
-    let scope = input.scope.clone();
-    let paths = resolve_workspace_paths_by_id(&workspace_id)?;
     let points = db::read_dataset_map_points(&paths.db_path, &workspace_id, &scope, &model_id)?;
 
     Ok(DatasetMapPayload {
@@ -284,6 +287,8 @@ pub fn probe_embedding_runtime_by_id(
 
 pub fn start_embedding_job_by_id(input: EmbeddingJobInput) -> Result<EmbeddingJob, String> {
     let paths = resolve_workspace_paths_by_id(&input.workspace_id)?;
+    let model_asset = resolve_model_asset(&paths.root, &input.model_id);
+    let smoke = smoke_test_session(&model_asset);
     let processed_items = generate_bootstrap_embedding_projections(
         &paths.db_path,
         &input.workspace_id,
@@ -301,7 +306,8 @@ pub fn start_embedding_job_by_id(input: EmbeddingJobInput) -> Result<EmbeddingJo
         processed_items,
         total_items: processed_items,
         message: Some(format!(
-            "Generated deterministic bootstrap projections for {processed_items} items."
+            "{} Generated deterministic bootstrap projections for {processed_items} items.",
+            smoke.detail
         )),
         updated_at: Utc::now().to_rfc3339(),
     })
@@ -323,27 +329,22 @@ pub fn save_dataset_map_reviews_by_id(
     Ok(input.updates)
 }
 
-fn default_embedding_models() -> Vec<EmbeddingModelOption> {
-    vec![
-        EmbeddingModelOption {
-            id: "clip-vit-b32".to_string(),
-            family: "clip".to_string(),
-            display_name: "CLIP ViT-B/32".to_string(),
-            embedding_dim: 512,
-            input_size: 224,
-            available: true,
-            download_required: false,
-        },
-        EmbeddingModelOption {
-            id: "dinov2-small".to_string(),
-            family: "dinov2".to_string(),
-            display_name: "DINOv2 Small".to_string(),
-            embedding_dim: 384,
-            input_size: 224,
-            available: true,
-            download_required: false,
-        },
-    ]
+fn default_embedding_models(workspace_root: &Path) -> Vec<EmbeddingModelOption> {
+    default_model_registry()
+        .into_iter()
+        .map(|model| {
+            let asset_available = resolve_model_asset(workspace_root, &model.id).exists();
+            EmbeddingModelOption {
+                id: model.id,
+                family: model.family,
+                display_name: model.display_name,
+                embedding_dim: model.embedding_dim,
+                input_size: model.input_size,
+                available: asset_available,
+                download_required: !asset_available,
+            }
+        })
+        .collect()
 }
 
 fn default_embedding_runtime_probe(preference: &str) -> EmbeddingRuntimeProbe {
