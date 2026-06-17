@@ -257,6 +257,8 @@ pub struct ExportPreview {
     pub included_images: u32,
     pub excluded_images: u32,
     pub included_boxes: u32,
+    pub dataset_map_excluded_images: u32,
+    pub dataset_map_excluded_boxes: u32,
     pub filename_conflicts: u32,
     pub conflict_details: Vec<ExportFilenameConflict>,
     pub split_counts: SplitCounts,
@@ -265,6 +267,7 @@ pub struct ExportPreview {
 
 #[derive(Clone)]
 pub struct ExportAnnotationRecord {
+    pub id: String,
     pub category_key: String,
     pub category_name: String,
     pub annotation_format: String,
@@ -393,6 +396,7 @@ pub struct StartExportInput {
     pub random_seed: u64,
     pub output_path: String,
     pub allow_auto_rename_conflicts: bool,
+    pub exclude_dataset_map_items: bool,
     pub image_ids: Option<Vec<String>>,
     pub source_ids: Option<Vec<String>>,
     pub category_ids: Option<Vec<String>>,

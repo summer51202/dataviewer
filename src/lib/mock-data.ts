@@ -541,6 +541,8 @@ export const sampleExportPreview: ExportPreview = {
   includedImages: 1984,
   excludedImages: 231,
   includedBoxes: 8451,
+  datasetMapExcludedImages: 12,
+  datasetMapExcludedBoxes: 37,
   filenameConflicts: 4,
   conflictDetails: [
     {

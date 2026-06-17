@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use rusqlite::{params, Connection};
@@ -33,6 +33,11 @@ pub struct EmbeddingProjectionRow {
 pub struct EmbeddingVectorRow {
     pub target_id: String,
     pub vector: Vec<f32>,
+}
+
+pub struct DatasetMapExportExclusions {
+    pub image_ids: HashSet<String>,
+    pub annotation_ids: HashSet<String>,
 }
 
 const INIT_SQL: &str = r#"
@@ -985,6 +990,52 @@ pub fn upsert_dataset_review_marks(
         .map_err(|error| format!("failed to commit dataset review mark transaction: {error}"))?;
 
     Ok(())
+}
+
+pub fn read_dataset_map_export_exclusions(
+    db_path: &Path,
+    workspace_id: &str,
+) -> Result<DatasetMapExportExclusions, String> {
+    let connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT scope, target_id
+            FROM dataset_review_marks
+            WHERE workspace_id = ?1
+                AND status = 'exclude'
+                AND scope IN ('image', 'object')
+            "#,
+        )
+        .map_err(|error| format!("failed to prepare dataset map export exclusions query: {error}"))?;
+
+    let rows = statement
+        .query_map(params![workspace_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("failed to read dataset map export exclusions: {error}"))?;
+
+    let mut exclusions = DatasetMapExportExclusions {
+        image_ids: HashSet::new(),
+        annotation_ids: HashSet::new(),
+    };
+
+    for row in rows {
+        let (scope, target_id) = row
+            .map_err(|error| format!("failed to map dataset map export exclusion row: {error}"))?;
+        match scope.as_str() {
+            "image" => {
+                exclusions.image_ids.insert(target_id);
+            }
+            "object" => {
+                exclusions.annotation_ids.insert(target_id);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(exclusions)
 }
 
 pub fn read_embedding_job_items(
@@ -2065,6 +2116,8 @@ pub fn read_export_preview(db_path: &Path, default_output_path: &str) -> Result<
         included_images,
         excluded_images,
         included_boxes,
+        dataset_map_excluded_images: 0,
+        dataset_map_excluded_boxes: 0,
         filename_conflicts,
         conflict_details,
         split_counts: crate::models::SplitCounts { train, valid, test },
@@ -2223,6 +2276,7 @@ pub fn read_export_images(db_path: &Path) -> Result<Vec<ExportImageRecord>, Stri
             i.original_path,
             i.width,
             i.height,
+            a.id,
             COALESCE(uc.id, COALESCE(NULLIF(sc.normalized_name, ''), LOWER(sc.name))),
             COALESCE(uc.name, sc.name),
             a.annotation_format,
@@ -2245,6 +2299,7 @@ pub fn read_export_images(db_path: &Path) -> Result<Vec<ExportImageRecord>, Stri
             i.original_path,
             i.width,
             i.height,
+            a.id,
             COALESCE(NULLIF(sc.normalized_name, ''), LOWER(sc.name)),
             sc.name,
             a.annotation_format,
@@ -2271,13 +2326,14 @@ pub fn read_export_images(db_path: &Path) -> Result<Vec<ExportImageRecord>, Stri
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<u32>>(3)?,
                 row.get::<_, Option<u32>>(4)?,
-                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(5)?,
                 row.get::<_, Option<String>>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, f64>(8)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
                 row.get::<_, f64>(9)?,
                 row.get::<_, f64>(10)?,
                 row.get::<_, f64>(11)?,
+                row.get::<_, f64>(12)?,
             ))
         })
         .map_err(|error| format!("failed to read export rows: {error}"))?;
@@ -2290,6 +2346,7 @@ pub fn read_export_images(db_path: &Path) -> Result<Vec<ExportImageRecord>, Stri
             original_path,
             width,
             height,
+            annotation_id,
             category_key,
             category_name,
             annotation_format,
@@ -2310,6 +2367,7 @@ pub fn read_export_images(db_path: &Path) -> Result<Vec<ExportImageRecord>, Stri
 
         if let (Some(category_key), Some(category_name)) = (category_key, category_name) {
             image_entry.annotations.push(ExportAnnotationRecord {
+                id: annotation_id,
                 category_key,
                 category_name,
                 annotation_format,
@@ -2983,6 +3041,53 @@ mod tests {
         assert_eq!(row.1.as_deref(), Some("bad crop"));
         assert_eq!(row.2.as_deref(), Some("too blurry"));
         assert_eq!(row.3, "2026-06-17T00:01:00Z");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_dataset_map_export_exclusions_returns_excluded_image_and_object_ids() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("dataviewer-export-exclusions-{timestamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("workspace.db");
+        initialize_database(&db_path).unwrap();
+        seed_single_annotated_image(&db_path);
+
+        upsert_dataset_review_marks(
+            &db_path,
+            "ws-1",
+            "image",
+            &[DatasetReviewUpdate {
+                target_id: "image-1".into(),
+                status: "exclude".into(),
+                reason: None,
+                note: None,
+            }],
+            "2026-06-17T00:00:00Z",
+        )
+        .unwrap();
+        upsert_dataset_review_marks(
+            &db_path,
+            "ws-1",
+            "object",
+            &[DatasetReviewUpdate {
+                target_id: "ann-1".into(),
+                status: "exclude".into(),
+                reason: None,
+                note: None,
+            }],
+            "2026-06-17T00:00:01Z",
+        )
+        .unwrap();
+
+        let exclusions = read_dataset_map_export_exclusions(&db_path, "ws-1").unwrap();
+
+        assert!(exclusions.image_ids.contains("image-1"));
+        assert!(exclusions.annotation_ids.contains("ann-1"));
 
         let _ = std::fs::remove_dir_all(root);
     }

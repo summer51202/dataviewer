@@ -213,6 +213,8 @@ export type ExportPreview = {
   includedImages: number;
   excludedImages: number;
   includedBoxes: number;
+  datasetMapExcludedImages: number;
+  datasetMapExcludedBoxes: number;
   filenameConflicts: number;
   conflictDetails: {
     fileName: string;
@@ -246,6 +248,7 @@ export type StartExportInput = {
   randomSeed: number;
   outputPath: string;
   allowAutoRenameConflicts: boolean;
+  excludeDatasetMapItems: boolean;
   imageIds?: string[];
   sourceIds?: string[];
   categoryIds?: string[];

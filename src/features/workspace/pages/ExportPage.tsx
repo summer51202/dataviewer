@@ -123,6 +123,7 @@ export function ExportPage() {
   const [outputPath, setOutputPath] = useState("");
   const [lastSuggestedPath, setLastSuggestedPath] = useState("");
   const [allowAutoRenameConflicts, setAllowAutoRenameConflicts] = useState(true);
+  const [excludeDatasetMapItems, setExcludeDatasetMapItems] = useState(false);
   const [errorDetail, setErrorDetail] = useState("");
   const [folderOpenError, setFolderOpenError] = useState("");
 
@@ -137,6 +138,7 @@ export function ExportPage() {
         randomSeed: Number(randomSeed),
         outputPath,
         allowAutoRenameConflicts,
+        excludeDatasetMapItems,
         imageIds: exportImageIds,
       }),
     onMutate: () => {
@@ -294,6 +296,15 @@ export function ExportPage() {
         </div>
       ) : null}
 
+      {data.datasetMapExcludedImages > 0 || data.datasetMapExcludedBoxes > 0 ? (
+        <div className="status-banner status-banner-warning">
+          <strong>Dataset Map exclusions detected.</strong>
+          <span>
+            {data.datasetMapExcludedImages} images and {data.datasetMapExcludedBoxes} boxes are marked exclude. Export output is unchanged unless the Dataset Map exclusion option is enabled.
+          </span>
+        </div>
+      ) : null}
+
       {scopeSummary.totalCount === 0 ? (
         <div className="status-banner status-banner-warning">
           <strong>No images in the current export scope.</strong>
@@ -416,6 +427,23 @@ export function ExportPage() {
           </label>
         </div>
 
+        <div className="export-conflict-setting">
+          <div className="export-conflict-copy">
+            <strong>Dataset Map</strong>
+            <span>
+              Apply image-level and object-level exclude marks from Dataset Map to this export.
+            </span>
+          </div>
+          <label className="checkbox-row export-conflict-checkbox">
+            <input
+              checked={excludeDatasetMapItems}
+              onChange={(event) => setExcludeDatasetMapItems(event.target.checked)}
+              type="checkbox"
+            />
+            <span>Exclude items marked exclude in Dataset Map</span>
+          </label>
+        </div>
+
         <div className="button-row">
           <button className="button button-secondary" onClick={() => navigate(`/workspace/${workspaceId}/browser`)} type="button">
             Adjust Browser Scope
@@ -461,6 +489,7 @@ export function ExportPage() {
           <StatCard hint="categories present in exported annotations" label="Categories" value={data.categoryCount} />
           <StatCard hint="annotated images after scope filtering" label="Images Included" value={data.includedImages} />
           <StatCard hint="in scope but not exportable" label="Images Excluded" value={data.excludedImages} />
+          <StatCard hint="opt-in Dataset Map filter" label="Map Excluded" value={data.datasetMapExcludedImages + data.datasetMapExcludedBoxes} />
           <StatCard hint="total annotations" label="Boxes Included" value={data.includedBoxes} />
           <StatCard hint="pending manual review" label="Filename Conflicts" value={data.filenameConflicts} />
         </div>

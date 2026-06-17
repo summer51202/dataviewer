@@ -8,7 +8,7 @@ use std::sync::{LazyLock, Mutex};
 use chrono::Utc;
 
 use crate::cvat_api;
-use crate::db;
+use crate::db::{self, DatasetMapExportExclusions};
 use crate::embedding::jobs::{
     batch_size_for_backend, deterministic_embedding_for_item, EmbeddingRecord,
 };
@@ -501,6 +501,8 @@ pub fn load_export_preview_by_id(input: ExportPreviewInput) -> Result<crate::mod
         input.source_ids.as_deref().unwrap_or(&[]),
         input.category_ids.as_deref().unwrap_or(&[]),
     );
+    let dataset_map_exclusions =
+        db::read_dataset_map_export_exclusions(&paths.db_path, &input.workspace_id)?;
     let scoped_image_count = count_scoped_browser_images(
         &browser_payload,
         input.image_ids.as_deref(),
@@ -511,6 +513,7 @@ pub fn load_export_preview_by_id(input: ExportPreviewInput) -> Result<crate::mod
         &browser_payload,
         scoped_image_count,
         output_path,
+        &dataset_map_exclusions,
     ))
 }
 
@@ -530,6 +533,11 @@ pub fn start_export(input: StartExportInput) -> Result<StartExportResult, String
         input.source_ids.as_deref().unwrap_or(&[]),
         input.category_ids.as_deref().unwrap_or(&[]),
     );
+    if input.exclude_dataset_map_items {
+        let dataset_map_exclusions =
+            db::read_dataset_map_export_exclusions(&paths.db_path, &input.workspace_id)?;
+        images = apply_dataset_map_export_exclusions(images, &dataset_map_exclusions);
+    }
     let conflicts = collect_export_conflicts(&images, &browser_payload);
     if !conflicts.is_empty() && !input.allow_auto_rename_conflicts {
         return Err("filename conflicts detected; review conflicts and enable auto rename before exporting".into());
@@ -2685,6 +2693,48 @@ fn filter_export_images(
         .collect()
 }
 
+fn apply_dataset_map_export_exclusions(
+    images: Vec<ExportImageRecord>,
+    exclusions: &DatasetMapExportExclusions,
+) -> Vec<ExportImageRecord> {
+    images
+        .into_iter()
+        .filter_map(|mut image| {
+            if exclusions.image_ids.contains(&image.id) {
+                return None;
+            }
+
+            image
+                .annotations
+                .retain(|annotation| !exclusions.annotation_ids.contains(&annotation.id));
+
+            if image.annotations.is_empty() {
+                return None;
+            }
+
+            Some(image)
+        })
+        .collect()
+}
+
+fn count_dataset_map_export_exclusions(
+    images: &[ExportImageRecord],
+    exclusions: &DatasetMapExportExclusions,
+) -> (u32, u32) {
+    let excluded_images = images
+        .iter()
+        .filter(|image| exclusions.image_ids.contains(&image.id))
+        .count() as u32;
+    let excluded_boxes = images
+        .iter()
+        .filter(|image| !exclusions.image_ids.contains(&image.id))
+        .flat_map(|image| image.annotations.iter())
+        .filter(|annotation| exclusions.annotation_ids.contains(&annotation.id))
+        .count() as u32;
+
+    (excluded_images, excluded_boxes)
+}
+
 fn count_scoped_browser_images(
     browser_payload: &BrowserPayload,
     selected_image_ids: Option<&[String]>,
@@ -2741,9 +2791,12 @@ fn build_export_preview(
     browser_payload: &BrowserPayload,
     scoped_image_count: u32,
     output_path: String,
+    dataset_map_exclusions: &DatasetMapExportExclusions,
 ) -> crate::models::ExportPreview {
     let included_images = images.len() as u32;
     let included_boxes = images.iter().map(|image| image.annotations.len() as u32).sum();
+    let (dataset_map_excluded_images, dataset_map_excluded_boxes) =
+        count_dataset_map_export_exclusions(&images, dataset_map_exclusions);
     let filename_conflicts = collect_export_conflicts(&images, browser_payload);
     let train = ((included_images as f64) * 0.70).floor() as u32;
     let valid = ((included_images as f64) * 0.15).floor() as u32;
@@ -2759,6 +2812,8 @@ fn build_export_preview(
         included_images,
         excluded_images: scoped_image_count.saturating_sub(included_images),
         included_boxes,
+        dataset_map_excluded_images,
+        dataset_map_excluded_boxes,
         filename_conflicts: filename_conflicts.len() as u32,
         conflict_details: filename_conflicts,
         split_counts: crate::models::SplitCounts { train, valid, test },
@@ -3229,6 +3284,69 @@ mod tests {
     }
 
     #[test]
+    fn apply_dataset_map_export_exclusions_removes_marked_images_and_boxes() {
+        let images = vec![
+            ExportImageRecord {
+                id: "img-1".into(),
+                file_name: "one.jpg".into(),
+                original_path: "D:\\dataset\\one.jpg".into(),
+                width: Some(100),
+                height: Some(80),
+                annotations: vec![
+                    crate::models::ExportAnnotationRecord {
+                        id: "ann-1".into(),
+                        category_key: "scratch".into(),
+                        category_name: "scratch".into(),
+                        annotation_format: "coco".into(),
+                        bbox_x: 10.0,
+                        bbox_y: 20.0,
+                        bbox_width: 30.0,
+                        bbox_height: 16.0,
+                    },
+                    crate::models::ExportAnnotationRecord {
+                        id: "ann-2".into(),
+                        category_key: "dent".into(),
+                        category_name: "dent".into(),
+                        annotation_format: "coco".into(),
+                        bbox_x: 40.0,
+                        bbox_y: 20.0,
+                        bbox_width: 10.0,
+                        bbox_height: 10.0,
+                    },
+                ],
+            },
+            ExportImageRecord {
+                id: "img-2".into(),
+                file_name: "two.jpg".into(),
+                original_path: "D:\\dataset\\two.jpg".into(),
+                width: Some(100),
+                height: Some(80),
+                annotations: vec![crate::models::ExportAnnotationRecord {
+                    id: "ann-3".into(),
+                    category_key: "scratch".into(),
+                    category_name: "scratch".into(),
+                    annotation_format: "coco".into(),
+                    bbox_x: 10.0,
+                    bbox_y: 20.0,
+                    bbox_width: 30.0,
+                    bbox_height: 16.0,
+                }],
+            },
+        ];
+        let exclusions = DatasetMapExportExclusions {
+            image_ids: HashSet::from(["img-2".to_string()]),
+            annotation_ids: HashSet::from(["ann-1".to_string()]),
+        };
+
+        let filtered = apply_dataset_map_export_exclusions(images, &exclusions);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "img-1");
+        assert_eq!(filtered[0].annotations.len(), 1);
+        assert_eq!(filtered[0].annotations[0].id, "ann-2");
+    }
+
+    #[test]
     fn export_yolo_split_writes_label_files() {
         let root = make_temp_dir("yolo-export");
         let images_dir = root.join("train").join("images");
@@ -3245,6 +3363,7 @@ mod tests {
             width: Some(100),
             height: Some(80),
             annotations: vec![crate::models::ExportAnnotationRecord {
+                id: "ann-1".into(),
                 category_key: "helmet".into(),
                 category_name: "helmet".into(),
                 annotation_format: "coco".into(),
