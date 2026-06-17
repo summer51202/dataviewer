@@ -586,8 +586,213 @@ button, input { font: inherit; }
   color: #7a5a1c;
 }
 
+.dataset-map-page {
+  display: grid;
+  gap: 18px;
+}
+
+.dataset-map-toolbar {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+
+.dataset-map-tabs {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.dataset-map-control {
+  min-width: 190px;
+}
+
+.field select {
+  width: 100%;
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  padding: 12px 14px;
+  background: rgba(255,255,255,.88);
+  color: var(--text);
+}
+
+.dataset-map-layout {
+  display: grid;
+  grid-template-columns: 230px minmax(0, 1fr) 260px;
+  gap: 16px;
+  align-items: stretch;
+}
+
+.dataset-map-filter-panel,
+.dataset-map-selection-panel,
+.dataset-map-stage {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(255,255,255,.74);
+}
+
+.dataset-map-filter-panel,
+.dataset-map-selection-panel {
+  display: grid;
+  align-content: start;
+  gap: 16px;
+  padding: 16px;
+}
+
+.dataset-map-filter-block {
+  display: grid;
+  gap: 6px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.dataset-map-filter-block:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.dataset-map-stage {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.dataset-map-stage-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-soft);
+  flex-wrap: wrap;
+}
+
+.dataset-map-stage-header strong {
+  color: var(--text);
+}
+
+.dataset-map-canvas {
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  display: block;
+  border-radius: 16px;
+  border: 1px solid rgba(32,73,114,.12);
+  background: #f8fafc;
+}
+
+.dataset-map-canvas-bg {
+  fill: #f8fafc;
+}
+
+.dataset-map-point {
+  cursor: pointer;
+  stroke: rgba(255,255,255,.92);
+  stroke-width: 3;
+  transition: r .12s ease, stroke-width .12s ease, opacity .12s ease;
+}
+
+.dataset-map-point:hover,
+.dataset-map-point-selected {
+  stroke: var(--accent);
+  stroke-width: 4;
+}
+
+.dataset-map-point-unreviewed { fill: #54708c; }
+.dataset-map-point-needs-review { fill: #d97706; }
+.dataset-map-point-keep { fill: var(--success); }
+.dataset-map-point-fix { fill: #7c3aed; }
+.dataset-map-point-exclude { fill: #b42318; }
+
+.dataset-map-empty {
+  display: grid;
+  place-items: center;
+  min-height: 320px;
+  border-radius: 16px;
+  border: 1px dashed var(--line-strong);
+  color: var(--text-soft);
+  background: rgba(255,255,255,.62);
+}
+
+.dataset-map-legend {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  color: var(--text-soft);
+  font-size: .9rem;
+}
+
+.dataset-map-legend-unreviewed { background: #54708c; }
+.dataset-map-legend-needs-review { background: #d97706; }
+.dataset-map-legend-keep { background: var(--success); }
+.dataset-map-legend-fix { background: #7c3aed; }
+.dataset-map-legend-exclude { background: #b42318; }
+
+.dataset-map-selected-list,
+.dataset-map-review-queue {
+  display: grid;
+  gap: 10px;
+}
+
+.dataset-map-selected-item,
+.dataset-map-review-row {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: rgba(32,73,114,.05);
+}
+
+.dataset-map-selected-item span,
+.dataset-map-review-row span {
+  color: var(--text-soft);
+  font-size: .9rem;
+}
+
+.dataset-map-review-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.dataset-map-review-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.dataset-map-review-row strong,
+.dataset-map-review-row span {
+  display: block;
+}
+
+.dataset-map-review-badge {
+  white-space: nowrap;
+}
+
+.dataset-map-review-needs-review {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.dataset-map-review-keep {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.dataset-map-review-fix {
+  background: #eee7ff;
+  color: #5b21b6;
+}
+
+.dataset-map-review-exclude {
+  background: #fde8e2;
+  color: #8d352e;
+}
+
 @media (max-width: 1100px) {
-  .workspace-shell, .browser-layout, .image-detail-layout, .hero-panel { grid-template-columns: 1fr; }
+  .workspace-shell, .browser-layout, .image-detail-layout, .hero-panel, .dataset-map-layout { grid-template-columns: 1fr; }
   .workspace-sidebar { position: static; height: auto; }
 }
 
