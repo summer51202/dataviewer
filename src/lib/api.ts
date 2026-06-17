@@ -22,6 +22,8 @@ import {
   DatasetMapPayload,
   DatasetMapScope,
   DatasetReviewStatus,
+  EmbeddingJob,
+  EmbeddingRuntimeProbe,
   EmbeddingRuntimePreference,
   ExportHistoryEntry,
   ExportPreview,
@@ -213,7 +215,12 @@ export async function getDatasetMapPayload(input: {
   return invokeOrFallback<DatasetMapPayload>(
     "get_dataset_map_payload",
     { input },
-    { ...sampleDatasetMapPayload, workspaceId: input.workspaceId, scope: input.scope },
+    {
+      ...sampleDatasetMapPayload,
+      workspaceId: input.workspaceId,
+      scope: input.scope,
+      modelId: input.modelId ?? sampleDatasetMapPayload.modelId,
+    },
   );
 }
 
@@ -221,7 +228,7 @@ export async function probeEmbeddingRuntime(input: {
   workspaceId: string;
   preference: EmbeddingRuntimePreference;
 }) {
-  return invokeOrFallback(
+  return invokeOrFallback<EmbeddingRuntimeProbe>(
     "probe_embedding_runtime",
     { input },
     sampleDatasetMapPayload.runtime,
@@ -250,7 +257,7 @@ export async function startEmbeddingJob(input: {
   }
 
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke("start_embedding_job", { input });
+  return invoke<EmbeddingJob>("start_embedding_job", { input });
 }
 
 export async function saveDatasetMapReviews(input: {
@@ -263,7 +270,7 @@ export async function saveDatasetMapReviews(input: {
   }
 
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke("save_dataset_map_reviews", { input });
+  return invoke<typeof input.updates>("save_dataset_map_reviews", { input });
 }
 
 export async function getImageDetail(workspaceId: string, imageId: string) {
