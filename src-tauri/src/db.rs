@@ -12,6 +12,7 @@ use crate::models::{
     WorkspaceOverview,
 };
 use crate::paths::APP_VERSION;
+use crate::embedding::jobs::{CropRect, EmbeddingJobItem, EmbeddingRecord, serialize_f32_vector};
 
 pub struct DatasetMapProjectionTarget {
     pub target_id: String,
@@ -907,6 +908,165 @@ pub fn upsert_dataset_review_marks(
     transaction
         .commit()
         .map_err(|error| format!("failed to commit dataset review mark transaction: {error}"))?;
+
+    Ok(())
+}
+
+pub fn read_embedding_job_items(
+    db_path: &Path,
+    workspace_id: &str,
+    scope: &str,
+) -> Result<Vec<EmbeddingJobItem>, String> {
+    let connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+
+    let sql = match scope {
+        "object" => {
+            r#"
+            SELECT
+                a.id,
+                i.id,
+                a.id,
+                i.original_path,
+                a.bbox_x,
+                a.bbox_y,
+                a.bbox_width,
+                a.bbox_height
+            FROM annotations a
+            INNER JOIN images i ON i.id = a.image_id
+            WHERE a.workspace_id = ?1
+                AND i.health_status = 'healthy'
+            ORDER BY i.file_name ASC, a.id ASC
+            "#
+        }
+        "image" => {
+            r#"
+            SELECT
+                i.id,
+                i.id,
+                NULL,
+                i.original_path,
+                NULL,
+                NULL,
+                NULL,
+                NULL
+            FROM images i
+            WHERE i.workspace_id = ?1
+                AND i.health_status = 'healthy'
+                AND EXISTS (
+                    SELECT 1
+                    FROM annotations a
+                    WHERE a.image_id = i.id
+                )
+            ORDER BY i.file_name ASC, i.id ASC
+            "#
+        }
+        other => return Err(format!("unsupported embedding job scope '{other}'")),
+    };
+
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|error| format!("failed to prepare embedding job item query: {error}"))?;
+    let rows = statement
+        .query_map(params![workspace_id], |row| {
+            let bbox = match (
+                row.get::<_, Option<f64>>(4)?,
+                row.get::<_, Option<f64>>(5)?,
+                row.get::<_, Option<f64>>(6)?,
+                row.get::<_, Option<f64>>(7)?,
+            ) {
+                (Some(x), Some(y), Some(width), Some(height)) => Some(CropRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                }),
+                _ => None,
+            };
+
+            Ok(EmbeddingJobItem {
+                target_id: row.get(0)?,
+                image_id: row.get(1)?,
+                annotation_id: row.get(2)?,
+                original_path: row.get(3)?,
+                bbox,
+            })
+        })
+        .map_err(|error| format!("failed to read embedding job item rows: {error}"))?;
+
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row.map_err(|error| format!("failed to map embedding job item: {error}"))?);
+    }
+
+    Ok(items)
+}
+
+pub fn upsert_embeddings(db_path: &Path, records: &[EmbeddingRecord]) -> Result<(), String> {
+    let mut connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("failed to start embedding transaction: {error}"))?;
+
+    for record in records {
+        let vector = serialize_f32_vector(&record.vector);
+        let vector_norm = record
+            .vector
+            .iter()
+            .map(|value| (*value as f64) * (*value as f64))
+            .sum::<f64>()
+            .sqrt();
+
+        transaction
+            .execute(
+                r#"
+                INSERT INTO embeddings (
+                    id,
+                    workspace_id,
+                    scope,
+                    target_id,
+                    image_id,
+                    annotation_id,
+                    model_id,
+                    runtime_backend,
+                    vector,
+                    vector_norm,
+                    created_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ON CONFLICT(workspace_id, scope, target_id, model_id)
+                DO UPDATE SET
+                    image_id = excluded.image_id,
+                    annotation_id = excluded.annotation_id,
+                    runtime_backend = excluded.runtime_backend,
+                    vector = excluded.vector,
+                    vector_norm = excluded.vector_norm,
+                    created_at = excluded.created_at
+                "#,
+                params![
+                    format!(
+                        "embedding-{}-{}-{}-{}",
+                        record.workspace_id, record.scope, record.model_id, record.target_id
+                    ),
+                    &record.workspace_id,
+                    &record.scope,
+                    &record.target_id,
+                    &record.image_id,
+                    record.annotation_id.as_deref(),
+                    &record.model_id,
+                    &record.runtime_backend,
+                    vector,
+                    vector_norm,
+                    &record.created_at,
+                ],
+            )
+            .map_err(|error| format!("failed to upsert embedding: {error}"))?;
+    }
+
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit embedding transaction: {error}"))?;
 
     Ok(())
 }
@@ -2750,6 +2910,111 @@ mod tests {
         assert_eq!(row.3, "2026-06-17T00:01:00Z");
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_embedding_job_items_builds_object_and_image_manifests() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("dataviewer-job-items-{timestamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("workspace.db");
+        initialize_database(&db_path).unwrap();
+
+        seed_single_annotated_image(&db_path);
+
+        let object_items = read_embedding_job_items(&db_path, "ws-1", "object").unwrap();
+        let image_items = read_embedding_job_items(&db_path, "ws-1", "image").unwrap();
+
+        assert_eq!(object_items.len(), 1);
+        assert_eq!(object_items[0].target_id, "ann-1");
+        assert_eq!(object_items[0].annotation_id.as_deref(), Some("ann-1"));
+        assert!(object_items[0].bbox.is_some());
+        assert_eq!(image_items.len(), 1);
+        assert_eq!(image_items[0].target_id, "image-1");
+        assert_eq!(image_items[0].annotation_id, None);
+        assert!(image_items[0].bbox.is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn upsert_embeddings_stores_vector_blob() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("dataviewer-embeddings-{timestamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("workspace.db");
+        initialize_database(&db_path).unwrap();
+
+        seed_single_annotated_image(&db_path);
+
+        upsert_embeddings(
+            &db_path,
+            &[crate::embedding::jobs::EmbeddingRecord {
+                workspace_id: "ws-1".into(),
+                scope: "object".into(),
+                target_id: "ann-1".into(),
+                image_id: "image-1".into(),
+                annotation_id: Some("ann-1".into()),
+                model_id: "clip-vit-b32".into(),
+                runtime_backend: "cpu".into(),
+                vector: vec![1.0, -2.5],
+                created_at: "2026-06-17T00:00:00Z".into(),
+            }],
+        )
+        .unwrap();
+
+        let connection = Connection::open(&db_path).unwrap();
+        let blob: Vec<u8> = connection
+            .query_row(
+                "SELECT vector FROM embeddings WHERE workspace_id = ?1 AND scope = ?2 AND target_id = ?3",
+                params!["ws-1", "object", "ann-1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(blob, crate::embedding::jobs::serialize_f32_vector(&[1.0, -2.5]));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn seed_single_annotated_image(db_path: &Path) {
+        let connection = Connection::open(db_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspace_meta (id, name, workspace_path, created_at, updated_at, app_version) VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+                params!["ws-1", "Workspace", "D:\\workspace", "2026-06-17T00:00:00Z", APP_VERSION],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO source_folders (id, workspace_id, path, source_type, status, last_scan_at, image_count, category_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params!["source-1", "ws-1", "D:\\datasets\\source-1", "COCO", "ready", "2026-06-17T00:00:00Z", 1, 1],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images (id, workspace_id, source_id, file_name, original_path, width, height, annotation_status, health_status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                params!["image-1", "ws-1", "source-1", "frame.jpg", "D:\\datasets\\source-1\\frame.jpg", 100, 50, "annotated", "healthy", "2026-06-17T00:00:00Z"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO categories (id, workspace_id, source_id, name, normalized_name, category_role, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                params!["cat-1", "ws-1", "source-1", "screw", "screw", "source", "2026-06-17T00:00:00Z"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO annotations (id, workspace_id, image_id, source_id, source_category_id, bbox_x, bbox_y, bbox_width, bbox_height, annotation_format, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                params!["ann-1", "ws-1", "image-1", "source-1", "cat-1", 10.0, 5.0, 20.0, 10.0, "coco", "2026-06-17T00:00:00Z"],
+            )
+            .unwrap();
     }
 }
 

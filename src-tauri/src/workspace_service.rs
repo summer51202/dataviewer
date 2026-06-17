@@ -9,6 +9,9 @@ use chrono::Utc;
 
 use crate::cvat_api;
 use crate::db;
+use crate::embedding::jobs::{
+    batch_size_for_backend, deterministic_embedding_for_item, EmbeddingRecord,
+};
 use crate::embedding::projection::deterministic_projection;
 use crate::embedding::providers::smoke_test_session;
 use crate::embedding::runtime::{
@@ -289,25 +292,51 @@ pub fn start_embedding_job_by_id(input: EmbeddingJobInput) -> Result<EmbeddingJo
     let paths = resolve_workspace_paths_by_id(&input.workspace_id)?;
     let model_asset = resolve_model_asset(&paths.root, &input.model_id);
     let smoke = smoke_test_session(&model_asset);
-    let processed_items = generate_bootstrap_embedding_projections(
+    let probe = probe_runtime(&input.runtime_preference);
+    let runtime_backend = probe.selected_backend;
+    let batch_size = batch_size_for_backend(runtime_backend);
+    let embedding_dim = default_model_registry()
+        .into_iter()
+        .find(|model| model.id == input.model_id)
+        .map(|model| model.embedding_dim as usize)
+        .unwrap_or(512);
+    let items = db::read_embedding_job_items(&paths.db_path, &input.workspace_id, &input.scope)?;
+    let now = Utc::now().to_rfc3339();
+    let records = items
+        .iter()
+        .map(|item| EmbeddingRecord {
+            workspace_id: input.workspace_id.clone(),
+            scope: input.scope.clone(),
+            target_id: item.target_id.clone(),
+            image_id: item.image_id.clone(),
+            annotation_id: item.annotation_id.clone(),
+            model_id: input.model_id.clone(),
+            runtime_backend: runtime_backend.as_str().to_string(),
+            vector: deterministic_embedding_for_item(item, &input.model_id, embedding_dim),
+            created_at: now.clone(),
+        })
+        .collect::<Vec<_>>();
+    db::upsert_embeddings(&paths.db_path, &records)?;
+    generate_bootstrap_embedding_projections(
         &paths.db_path,
         &input.workspace_id,
         &input.scope,
         &input.model_id,
     )?;
+    let processed_items = records.len() as u32;
 
     Ok(EmbeddingJob {
         id: format!("embedding-job-{}", Utc::now().timestamp_millis()),
         scope: input.scope,
         model_id: input.model_id,
         runtime_preference: input.runtime_preference,
-        runtime_backend: Some("cpu".to_string()),
+        runtime_backend: Some(runtime_backend.as_str().to_string()),
         status: "completed".to_string(),
         processed_items,
         total_items: processed_items,
         message: Some(format!(
-            "{} Generated deterministic bootstrap projections for {processed_items} items.",
-            smoke.detail
+            "{} Stored {processed_items} embedding vectors with batch size {batch_size}; generated deterministic bootstrap projections.",
+            smoke.detail,
         )),
         updated_at: Utc::now().to_rfc3339(),
     })
@@ -2943,6 +2972,7 @@ fn slugify_workspace_name(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::{params, Connection};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_temp_dir(name: &str) -> PathBuf {
@@ -2953,6 +2983,90 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dataviewer-{name}-{unique}"));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn seed_embedding_workspace(scope_name: &str) -> (PathBuf, WorkspaceOverview) {
+        let parent = make_temp_dir(scope_name);
+        let workspace_name = format!("Embedding {scope_name}");
+        let overview = create_workspace(CreateWorkspaceInput {
+            name: workspace_name,
+            parent_path: parent.to_string_lossy().to_string(),
+            allow_existing_target: None,
+        })
+        .unwrap();
+        let paths = build_workspace_paths(&PathBuf::from(&overview.workspace_path));
+        let now = Utc::now().to_rfc3339();
+        let source_path = paths.root.join("source-a");
+        fs::create_dir_all(&source_path).unwrap();
+        let image_path = source_path.join("part-a.jpg");
+        fs::write(&image_path, b"jpg").unwrap();
+
+        db::insert_source_folder(
+            &paths.db_path,
+            "source-1",
+            &overview.id,
+            &normalize_path_string(&source_path),
+            "COCO",
+            "ready",
+            Some(&now),
+        )
+        .unwrap();
+        db::replace_source_images(
+            &paths.db_path,
+            "source-1",
+            &[StoredImageRecord {
+                id: "img-1".to_string(),
+                workspace_id: overview.id.clone(),
+                source_id: "source-1".to_string(),
+                file_name: "part-a.jpg".to_string(),
+                original_path: normalize_path_string(&image_path),
+                relative_path: Some("part-a.jpg".to_string()),
+                width: Some(100),
+                height: Some(80),
+                annotation_status: "annotated".to_string(),
+                health_status: "healthy".to_string(),
+                health_error: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            }],
+        )
+        .unwrap();
+        db::replace_source_categories(
+            &paths.db_path,
+            "source-1",
+            &[StoredCategoryRecord {
+                id: "cat-1".to_string(),
+                workspace_id: overview.id.clone(),
+                source_id: "source-1".to_string(),
+                name: "scratch".to_string(),
+                normalized_name: "scratch".to_string(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            }],
+        )
+        .unwrap();
+        db::replace_source_annotations(
+            &paths.db_path,
+            "source-1",
+            &[StoredAnnotationRecord {
+                id: "ann-1".to_string(),
+                workspace_id: overview.id.clone(),
+                image_id: "img-1".to_string(),
+                source_id: "source-1".to_string(),
+                source_category_id: Some("cat-1".to_string()),
+                category_id: Some("cat-1".to_string()),
+                bbox_x: 10.0,
+                bbox_y: 12.0,
+                bbox_width: 20.0,
+                bbox_height: 24.0,
+                annotation_format: "coco".to_string(),
+                created_at: now.clone(),
+                updated_at: now,
+            }],
+        )
+        .unwrap();
+
+        (parent, overview)
     }
 
     #[test]
@@ -3027,6 +3141,37 @@ mod tests {
         assert_eq!(parse_json_number(&serde_json::json!("444.00")), Some(444.0));
         assert_eq!(parse_json_number(&serde_json::json!(" 508.00 ")), Some(508.0));
         assert_eq!(parse_json_number(&serde_json::json!("abc")), None);
+    }
+
+    #[test]
+    fn start_embedding_job_stores_object_embedding_rows() {
+        let (parent, overview) = seed_embedding_workspace("object-job");
+
+        let job = start_embedding_job_by_id(EmbeddingJobInput {
+            workspace_id: overview.id.clone(),
+            scope: "object".to_string(),
+            model_id: "clip-vit-b32".to_string(),
+            runtime_preference: "auto".to_string(),
+        })
+        .unwrap();
+
+        let paths = build_workspace_paths(&PathBuf::from(&overview.workspace_path));
+        let connection = Connection::open(&paths.db_path).unwrap();
+        let (target_id, blob_len): (String, usize) = connection
+            .query_row(
+                "SELECT target_id, length(vector) FROM embeddings WHERE workspace_id = ?1 AND scope = 'object' AND model_id = 'clip-vit-b32'",
+                params![overview.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(job.status, "completed");
+        assert_eq!(job.processed_items, 1);
+        assert_eq!(job.total_items, 1);
+        assert_eq!(target_id, "ann-1");
+        assert!(blob_len > 0);
+
+        let _ = fs::remove_dir_all(parent);
     }
 
     #[test]
