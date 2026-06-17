@@ -1,6 +1,7 @@
 import {
   sampleAnnotationVersions,
   sampleBrowserPayload,
+  sampleDatasetMapPayload,
   sampleCvatTasks,
   sampleExportHistory,
   sampleExportPreview,
@@ -18,6 +19,10 @@ import {
   CreateCvatTaskInput,
   CvatSettings,
   CvatTask,
+  DatasetMapPayload,
+  DatasetMapScope,
+  DatasetReviewStatus,
+  EmbeddingRuntimePreference,
   ExportHistoryEntry,
   ExportPreview,
   ExportPreviewInput,
@@ -198,6 +203,67 @@ export async function getBrowserPayload(workspaceId: string) {
     { workspaceId },
     sampleBrowserPayload,
   );
+}
+
+export async function getDatasetMapPayload(input: {
+  workspaceId: string;
+  scope: DatasetMapScope;
+  modelId?: string;
+}) {
+  return invokeOrFallback<DatasetMapPayload>(
+    "get_dataset_map_payload",
+    { input },
+    { ...sampleDatasetMapPayload, workspaceId: input.workspaceId, scope: input.scope },
+  );
+}
+
+export async function probeEmbeddingRuntime(input: {
+  workspaceId: string;
+  preference: EmbeddingRuntimePreference;
+}) {
+  return invokeOrFallback(
+    "probe_embedding_runtime",
+    { input },
+    sampleDatasetMapPayload.runtime,
+  );
+}
+
+export async function startEmbeddingJob(input: {
+  workspaceId: string;
+  scope: DatasetMapScope;
+  modelId: string;
+  runtimePreference: EmbeddingRuntimePreference;
+}) {
+  if (!hasTauriRuntime()) {
+    return {
+      id: `job-${Date.now()}`,
+      scope: input.scope,
+      modelId: input.modelId,
+      runtimePreference: input.runtimePreference,
+      runtimeBackend: "cpu" as const,
+      status: "completed" as const,
+      processedItems: sampleDatasetMapPayload.points.length,
+      totalItems: sampleDatasetMapPayload.points.length,
+      message: "Mock embedding job completed.",
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke("start_embedding_job", { input });
+}
+
+export async function saveDatasetMapReviews(input: {
+  workspaceId: string;
+  scope: DatasetMapScope;
+  updates: Array<{ targetId: string; status: DatasetReviewStatus; reason?: string; note?: string }>;
+}) {
+  if (!hasTauriRuntime()) {
+    return input.updates;
+  }
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke("save_dataset_map_reviews", { input });
 }
 
 export async function getImageDetail(workspaceId: string, imageId: string) {
