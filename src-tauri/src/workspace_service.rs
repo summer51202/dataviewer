@@ -258,14 +258,18 @@ pub fn load_dataset_map_payload_by_id(
         .clone()
         .filter(|id| models.iter().any(|model| model.id == *id))
         .unwrap_or_else(|| "clip-vit-b32".to_string());
+    let workspace_id = input.workspace_id.clone();
+    let scope = input.scope.clone();
+    let paths = resolve_workspace_paths_by_id(&workspace_id)?;
+    let points = db::read_dataset_map_points(&paths.db_path, &workspace_id, &scope, &model_id)?;
 
     Ok(DatasetMapPayload {
-        workspace_id: input.workspace_id,
-        scope: input.scope,
+        workspace_id,
+        scope,
         model_id,
         models,
         runtime: default_embedding_runtime_probe("auto"),
-        points: vec![],
+        points,
         jobs: vec![],
     })
 }

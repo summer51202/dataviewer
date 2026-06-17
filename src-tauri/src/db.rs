@@ -4,10 +4,12 @@ use std::path::Path;
 use rusqlite::{params, Connection};
 
 use crate::models::{
-    BoundingBoxRecord, BoxSummary, BrowserPayload, ExportHistoryEntry, ImageCard, ImageDetailPayload,
-    ImportReviewRow, ExportAnnotationRecord, ExportConflictItem, ExportFilenameConflict,
-    ExportImageRecord, SourceFolder, StoredAnnotationRecord, StoredCategoryRecord,
-    StoredImageRecord, StoredSourceFolder, UnifiedCategory, WorkspaceOverview, AnnotationVersion,
+    AnnotationVersion, BoundingBoxRecord, BoxSummary, BrowserPayload, DatasetMapBbox,
+    DatasetMapPoint, ExportAnnotationRecord, ExportConflictItem,
+    ExportFilenameConflict, ExportHistoryEntry, ExportImageRecord, ImageCard,
+    ImageDetailPayload, ImportReviewRow, SourceFolder, StoredAnnotationRecord,
+    StoredCategoryRecord, StoredImageRecord, StoredSourceFolder, UnifiedCategory,
+    WorkspaceOverview,
 };
 use crate::paths::APP_VERSION;
 
@@ -135,6 +137,79 @@ CREATE TABLE IF NOT EXISTS cvat_tasks (
     FOREIGN KEY(workspace_id) REFERENCES workspace_meta(id)
 );
 
+CREATE TABLE IF NOT EXISTS embedding_models (
+    id TEXT PRIMARY KEY,
+    family TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    embedding_dim INTEGER NOT NULL,
+    input_size INTEGER NOT NULL,
+    preprocess_version TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS embedding_jobs (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    runtime_preference TEXT NOT NULL,
+    runtime_backend TEXT,
+    status TEXT NOT NULL,
+    processed_items INTEGER NOT NULL DEFAULT 0,
+    total_items INTEGER NOT NULL DEFAULT 0,
+    message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(workspace_id) REFERENCES workspace_meta(id)
+);
+
+CREATE TABLE IF NOT EXISTS embeddings (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    image_id TEXT NOT NULL,
+    annotation_id TEXT,
+    model_id TEXT NOT NULL,
+    runtime_backend TEXT NOT NULL,
+    vector BLOB NOT NULL,
+    vector_norm REAL,
+    created_at TEXT NOT NULL,
+    UNIQUE(workspace_id, scope, target_id, model_id),
+    FOREIGN KEY(workspace_id) REFERENCES workspace_meta(id),
+    FOREIGN KEY(image_id) REFERENCES images(id),
+    FOREIGN KEY(annotation_id) REFERENCES annotations(id)
+);
+
+CREATE TABLE IF NOT EXISTS embedding_projections (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    projection_method TEXT NOT NULL,
+    x REAL NOT NULL,
+    y REAL NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(workspace_id, scope, target_id, model_id, projection_method),
+    FOREIGN KEY(workspace_id) REFERENCES workspace_meta(id)
+);
+
+CREATE TABLE IF NOT EXISTS dataset_review_marks (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(workspace_id, scope, target_id),
+    FOREIGN KEY(workspace_id) REFERENCES workspace_meta(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_source_folders_workspace_id ON source_folders(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_images_source_id ON images(source_id);
 CREATE INDEX IF NOT EXISTS idx_images_workspace_id ON images(workspace_id);
@@ -147,6 +222,9 @@ CREATE INDEX IF NOT EXISTS idx_annotations_image_id ON annotations(image_id);
 CREATE INDEX IF NOT EXISTS idx_annotations_workspace_id ON annotations(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_export_jobs_workspace_id ON export_jobs(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_cvat_tasks_workspace_id ON cvat_tasks(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_embeddings_workspace_scope_model ON embeddings(workspace_id, scope, model_id);
+CREATE INDEX IF NOT EXISTS idx_embedding_projections_workspace_scope_model ON embedding_projections(workspace_id, scope, model_id);
+CREATE INDEX IF NOT EXISTS idx_dataset_review_marks_workspace_scope ON dataset_review_marks(workspace_id, scope);
 "#;
 
 pub fn initialize_database(db_path: &Path) -> Result<(), String> {
@@ -496,6 +574,161 @@ pub fn read_browser_payload(db_path: &Path) -> Result<BrowserPayload, String> {
         categories: read_browser_categories(db_path)?,
         images: read_image_cards(db_path)?,
     })
+}
+
+pub fn read_dataset_map_points(
+    db_path: &Path,
+    workspace_id: &str,
+    scope: &str,
+    model_id: &str,
+) -> Result<Vec<DatasetMapPoint>, String> {
+    let connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT
+                p.target_id,
+                p.scope,
+                i.id,
+                i.file_name,
+                i.source_id,
+                COALESCE(sf.path, ''),
+                a.id,
+                COALESCE(a.category_id, a.source_category_id),
+                COALESCE(uc.name, sc.name),
+                a.bbox_x,
+                a.bbox_y,
+                a.bbox_width,
+                a.bbox_height,
+                i.width,
+                i.height,
+                p.x,
+                p.y,
+                COALESCE(r.status, 'unreviewed')
+            FROM embedding_projections p
+            LEFT JOIN annotations a
+                ON p.scope = 'object'
+                AND a.id = p.target_id
+                AND a.workspace_id = p.workspace_id
+            LEFT JOIN images i
+                ON i.workspace_id = p.workspace_id
+                AND (
+                    (p.scope = 'image' AND i.id = p.target_id)
+                    OR (p.scope = 'object' AND i.id = a.image_id)
+                )
+            LEFT JOIN source_folders sf ON sf.id = i.source_id
+            LEFT JOIN categories uc ON uc.id = a.category_id
+            LEFT JOIN categories sc ON sc.id = a.source_category_id
+            LEFT JOIN dataset_review_marks r
+                ON r.workspace_id = p.workspace_id
+                AND r.scope = p.scope
+                AND r.target_id = p.target_id
+            WHERE p.workspace_id = ?1
+                AND p.scope = ?2
+                AND p.model_id = ?3
+                AND i.id IS NOT NULL
+            ORDER BY i.file_name ASC, p.target_id ASC
+            "#,
+        )
+        .map_err(|error| format!("failed to prepare dataset map points query: {error}"))?;
+
+    let rows = statement
+        .query_map(params![workspace_id, scope, model_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<f64>>(9)?,
+                row.get::<_, Option<f64>>(10)?,
+                row.get::<_, Option<f64>>(11)?,
+                row.get::<_, Option<f64>>(12)?,
+                row.get::<_, Option<u32>>(13)?,
+                row.get::<_, Option<u32>>(14)?,
+                row.get::<_, f64>(15)?,
+                row.get::<_, f64>(16)?,
+                row.get::<_, String>(17)?,
+            ))
+        })
+        .map_err(|error| format!("failed to read dataset map point rows: {error}"))?;
+
+    let mut points = Vec::new();
+    for row in rows {
+        let (
+            target_id,
+            scope,
+            image_id,
+            filename,
+            source_id,
+            source_path,
+            annotation_id,
+            category_id,
+            category_name,
+            bbox_x,
+            bbox_y,
+            bbox_width,
+            bbox_height,
+            image_width,
+            image_height,
+            x,
+            y,
+            review_status,
+        ) = row.map_err(|error| format!("failed to map dataset map point row: {error}"))?;
+
+        let bbox = match (bbox_x, bbox_y, bbox_width, bbox_height) {
+            (Some(x), Some(y), Some(width), Some(height)) => {
+                let area_ratio = image_width
+                    .zip(image_height)
+                    .and_then(|(image_width, image_height)| {
+                        let image_area = (image_width as f64) * (image_height as f64);
+                        if image_area > 0.0 {
+                            Some((width * height) / image_area)
+                        } else {
+                            None
+                        }
+                    });
+
+                Some(DatasetMapBbox {
+                    x,
+                    y,
+                    width,
+                    height,
+                    area_ratio,
+                })
+            }
+            _ => None,
+        };
+
+        let source_name = Path::new(&source_path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(&source_id)
+            .to_string();
+
+        points.push(DatasetMapPoint {
+            id: target_id,
+            scope,
+            image_id,
+            annotation_id,
+            filename,
+            source_id,
+            source_name,
+            category_id,
+            category_name,
+            bbox,
+            x,
+            y,
+            review_status,
+        });
+    }
+
+    Ok(points)
 }
 
 pub fn read_import_review_rows(db_path: &Path) -> Result<Vec<ImportReviewRow>, String> {
@@ -2159,6 +2392,44 @@ fn slugify_name(value: &str) -> String {
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>()
         .join("-")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initialize_database_creates_dataset_map_tables() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("dataviewer-db-schema-{timestamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("workspace.db");
+
+        initialize_database(&db_path).unwrap();
+
+        let connection = Connection::open(&db_path).unwrap();
+        for table_name in [
+            "embedding_models",
+            "embedding_jobs",
+            "embeddings",
+            "embedding_projections",
+            "dataset_review_marks",
+        ] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(1) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table_name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing table {table_name}");
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 
