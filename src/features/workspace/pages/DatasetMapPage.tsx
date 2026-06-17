@@ -24,12 +24,18 @@ const reviewStatusLabels: Record<DatasetReviewStatus, string> = {
   exclude: "Exclude",
 };
 
-function normalizeCoordinate(value: number, min: number, max: number, padding: number) {
+function normalizeCoordinate(
+  value: number,
+  min: number,
+  max: number,
+  padding: number,
+  size = 1000,
+) {
   if (max === min) {
-    return 500;
+    return size / 2;
   }
 
-  return padding + ((value - min) / (max - min)) * (1000 - padding * 2);
+  return padding + ((value - min) / (max - min)) * (size - padding * 2);
 }
 
 function formatAreaRatio(point: DatasetMapPoint) {
@@ -139,16 +145,16 @@ export function DatasetMapPage() {
   }, [visiblePoints]);
 
   const reviewMutation = useMutation({
-    mutationFn: (status: DatasetReviewStatus) =>
+    mutationFn: ({ status, pointIds }: { status: DatasetReviewStatus; pointIds: string[] }) =>
       saveDatasetMapReviews({
         workspaceId,
         scope,
-        updates: selectedPointIds.map((targetId) => ({ targetId, status })),
+        updates: pointIds.map((targetId) => ({ targetId, status })),
       }),
-    onSuccess: (_updates, status) => {
+    onSuccess: (_updates, { status, pointIds }) => {
       setLocalReviewState((current) => {
         const next = { ...current };
-        selectedPointIds.forEach((pointId) => {
+        pointIds.forEach((pointId) => {
           next[pointId] = status;
         });
         return next;
@@ -296,7 +302,7 @@ export function DatasetMapPage() {
                 <rect className="dataset-map-canvas-bg" x="0" y="0" width="1000" height="640" />
                 {visiblePoints.map((point) => {
                   const cx = normalizeCoordinate(point.x, bounds.minX, bounds.maxX, 60);
-                  const cy = 640 - normalizeCoordinate(point.y, bounds.minY, bounds.maxY, 50);
+                  const cy = 640 - normalizeCoordinate(point.y, bounds.minY, bounds.maxY, 50, 640);
                   const selected = selectedPointSet.has(point.id);
                   return (
                     <g className="dataset-map-point-hit" key={point.id}>
@@ -361,7 +367,7 @@ export function DatasetMapPage() {
                   className="button button-secondary button-sm"
                   disabled={selectedPointIds.length === 0 || reviewMutation.isPending}
                   key={status}
-                  onClick={() => reviewMutation.mutate(status)}
+                  onClick={() => reviewMutation.mutate({ status, pointIds: selectedPointIds })}
                   type="button"
                 >
                   {reviewStatusLabels[status]}
