@@ -257,3 +257,89 @@ export type StartExportResult = {
   exportedImages: number;
   exportedBoxes: number;
 };
+
+export type DatasetMapScope = "object" | "image";
+export type EmbeddingFamily = "clip" | "dinov2";
+export type EmbeddingRuntimePreference = "auto" | "cuda" | "windows-gpu" | "cpu";
+export type EmbeddingRuntimeBackend = "cuda" | "windows-gpu" | "cpu";
+export type EmbeddingJobStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
+export type DatasetReviewStatus =
+  | "unreviewed"
+  | "needs-review"
+  | "keep"
+  | "fix"
+  | "exclude";
+
+export type EmbeddingModelOption = {
+  id: string;
+  family: EmbeddingFamily;
+  displayName: string;
+  embeddingDim: number;
+  inputSize: number;
+  available: boolean;
+  downloadRequired: boolean;
+};
+
+export type EmbeddingRuntimeCapability = {
+  backend: EmbeddingRuntimeBackend;
+  available: boolean;
+  label: string;
+  detail: string;
+};
+
+export type EmbeddingRuntimeProbe = {
+  preference: EmbeddingRuntimePreference;
+  selectedBackend: EmbeddingRuntimeBackend;
+  capabilities: EmbeddingRuntimeCapability[];
+  fallbackReason?: string | null;
+};
+
+export type DatasetMapPoint = {
+  id: string;
+  scope: DatasetMapScope;
+  imageId: string;
+  annotationId?: string | null;
+  filename: string;
+  sourceId: string;
+  sourceName: string;
+  categoryId?: string | null;
+  categoryName?: string | null;
+  bbox?: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    areaRatio?: number | null;
+  } | null;
+  x: number;
+  y: number;
+  reviewStatus: DatasetReviewStatus;
+};
+
+export type EmbeddingJob = {
+  id: string;
+  scope: DatasetMapScope;
+  modelId: string;
+  runtimePreference: EmbeddingRuntimePreference;
+  runtimeBackend?: EmbeddingRuntimeBackend | null;
+  status: EmbeddingJobStatus;
+  processedItems: number;
+  totalItems: number;
+  message?: string | null;
+  updatedAt: string;
+};
+
+export type DatasetMapPayload = {
+  workspaceId: string;
+  scope: DatasetMapScope;
+  modelId: string;
+  models: EmbeddingModelOption[];
+  runtime: EmbeddingRuntimeProbe;
+  points: DatasetMapPoint[];
+  jobs: EmbeddingJob[];
+};
