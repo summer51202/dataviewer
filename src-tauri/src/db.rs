@@ -30,6 +30,11 @@ pub struct EmbeddingProjectionRow {
     pub created_at: String,
 }
 
+pub struct EmbeddingVectorRow {
+    pub target_id: String,
+    pub vector: Vec<f32>,
+}
+
 const INIT_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS workspace_meta (
     id TEXT PRIMARY KEY,
@@ -644,6 +649,22 @@ pub fn read_dataset_map_points(
             WHERE p.workspace_id = ?1
                 AND p.scope = ?2
                 AND p.model_id = ?3
+                AND p.projection_method = (
+                    SELECT p2.projection_method
+                    FROM embedding_projections p2
+                    WHERE p2.workspace_id = p.workspace_id
+                        AND p2.scope = p.scope
+                        AND p2.target_id = p.target_id
+                        AND p2.model_id = p.model_id
+                    ORDER BY
+                        CASE p2.projection_method
+                            WHEN 'pca-v1' THEN 0
+                            WHEN 'bootstrap-deterministic' THEN 1
+                            ELSE 2
+                        END,
+                        p2.created_at DESC
+                    LIMIT 1
+                )
                 AND i.id IS NOT NULL
             ORDER BY i.file_name ASC, p.target_id ASC
             "#,
@@ -853,6 +874,60 @@ pub fn upsert_embedding_projections(
         .map_err(|error| format!("failed to commit embedding projection transaction: {error}"))?;
 
     Ok(())
+}
+
+pub fn read_embedding_vectors_for_projection(
+    db_path: &Path,
+    workspace_id: &str,
+    scope: &str,
+    model_id: &str,
+) -> Result<Vec<EmbeddingVectorRow>, String> {
+    let connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT target_id, vector
+            FROM embeddings
+            WHERE workspace_id = ?1
+                AND scope = ?2
+                AND model_id = ?3
+            ORDER BY target_id ASC
+            "#,
+        )
+        .map_err(|error| format!("failed to prepare embedding vector query: {error}"))?;
+
+    let rows = statement
+        .query_map(params![workspace_id, scope, model_id], |row| {
+            let bytes: Vec<u8> = row.get(1)?;
+            Ok((row.get::<_, String>(0)?, bytes))
+        })
+        .map_err(|error| format!("failed to read embedding vector rows: {error}"))?;
+
+    let mut vectors = Vec::new();
+    for row in rows {
+        let (target_id, bytes) = row.map_err(|error| format!("failed to map embedding vector row: {error}"))?;
+        vectors.push(EmbeddingVectorRow {
+            target_id,
+            vector: deserialize_f32_vector(&bytes)?,
+        });
+    }
+
+    Ok(vectors)
+}
+
+fn deserialize_f32_vector(bytes: &[u8]) -> Result<Vec<f32>, String> {
+    if bytes.len() % 4 != 0 {
+        return Err(format!(
+            "embedding vector byte length must be divisible by 4, got {}",
+            bytes.len()
+        ));
+    }
+
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
 }
 
 pub fn upsert_dataset_review_marks(
@@ -2979,6 +3054,100 @@ mod tests {
             .unwrap();
 
         assert_eq!(blob, crate::embedding::jobs::serialize_f32_vector(&[1.0, -2.5]));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_embedding_vectors_for_projection_decodes_little_endian_vectors() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("dataviewer-projection-vectors-{timestamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("workspace.db");
+        initialize_database(&db_path).unwrap();
+
+        seed_single_annotated_image(&db_path);
+        upsert_embeddings(
+            &db_path,
+            &[crate::embedding::jobs::EmbeddingRecord {
+                workspace_id: "ws-1".into(),
+                scope: "object".into(),
+                target_id: "ann-1".into(),
+                image_id: "image-1".into(),
+                annotation_id: Some("ann-1".into()),
+                model_id: "clip-vit-b32".into(),
+                runtime_backend: "cpu".into(),
+                vector: vec![0.25, -0.5, 1.0],
+                created_at: "2026-06-17T00:00:00Z".into(),
+            }],
+        )
+        .unwrap();
+
+        let rows = read_embedding_vectors_for_projection(
+            &db_path,
+            "ws-1",
+            "object",
+            "clip-vit-b32",
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target_id, "ann-1");
+        assert_eq!(rows[0].vector, vec![0.25, -0.5, 1.0]);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_dataset_map_points_prefers_pca_projection_over_bootstrap() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("dataviewer-pca-point-priority-{timestamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("workspace.db");
+        initialize_database(&db_path).unwrap();
+        seed_single_annotated_image(&db_path);
+
+        upsert_embedding_projections(
+            &db_path,
+            &[
+                EmbeddingProjectionRow {
+                    id: "projection-bootstrap".to_string(),
+                    workspace_id: "ws-1".to_string(),
+                    scope: "object".to_string(),
+                    target_id: "ann-1".to_string(),
+                    model_id: "clip-vit-b32".to_string(),
+                    projection_method: "bootstrap-deterministic".to_string(),
+                    x: -0.8,
+                    y: -0.7,
+                    created_at: "2026-06-17T00:00:00Z".to_string(),
+                },
+                EmbeddingProjectionRow {
+                    id: "projection-pca".to_string(),
+                    workspace_id: "ws-1".to_string(),
+                    scope: "object".to_string(),
+                    target_id: "ann-1".to_string(),
+                    model_id: "clip-vit-b32".to_string(),
+                    projection_method: "pca-v1".to_string(),
+                    x: 0.25,
+                    y: 0.5,
+                    created_at: "2026-06-17T00:00:01Z".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let points = read_dataset_map_points(&db_path, "ws-1", "object", "clip-vit-b32").unwrap();
+
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].id, "ann-1");
+        assert_eq!(points[0].x, 0.25);
+        assert_eq!(points[0].y, 0.5);
 
         let _ = std::fs::remove_dir_all(root);
     }

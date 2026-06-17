@@ -12,7 +12,9 @@ use crate::db;
 use crate::embedding::jobs::{
     batch_size_for_backend, deterministic_embedding_for_item, EmbeddingRecord,
 };
-use crate::embedding::projection::deterministic_projection;
+use crate::embedding::projection::{
+    deterministic_projection, pca_projection, ProjectionInput,
+};
 use crate::embedding::providers::smoke_test_session;
 use crate::embedding::runtime::{
     default_model_registry, probe_runtime, resolve_model_asset, RuntimeBackend,
@@ -323,6 +325,12 @@ pub fn start_embedding_job_by_id(input: EmbeddingJobInput) -> Result<EmbeddingJo
         &input.scope,
         &input.model_id,
     )?;
+    let pca_items = generate_pca_embedding_projections(
+        &paths.db_path,
+        &input.workspace_id,
+        &input.scope,
+        &input.model_id,
+    )?;
     let processed_items = records.len() as u32;
 
     Ok(EmbeddingJob {
@@ -335,7 +343,7 @@ pub fn start_embedding_job_by_id(input: EmbeddingJobInput) -> Result<EmbeddingJo
         processed_items,
         total_items: processed_items,
         message: Some(format!(
-            "{} Stored {processed_items} embedding vectors with batch size {batch_size}; generated deterministic bootstrap projections.",
+            "{} Stored {processed_items} embedding vectors with batch size {batch_size}; generated {pca_items} PCA projections with deterministic bootstrap fallback.",
             smoke.detail,
         )),
         updated_at: Utc::now().to_rfc3339(),
@@ -434,6 +442,44 @@ fn generate_bootstrap_embedding_projections(
                 y,
                 created_at: now.clone(),
             }
+        })
+        .collect::<Vec<_>>();
+
+    db::upsert_embedding_projections(db_path, &projections)?;
+
+    Ok(projections.len() as u32)
+}
+
+fn generate_pca_embedding_projections(
+    db_path: &Path,
+    workspace_id: &str,
+    scope: &str,
+    model_id: &str,
+) -> Result<u32, String> {
+    let vectors = db::read_embedding_vectors_for_projection(db_path, workspace_id, scope, model_id)?;
+    let inputs = vectors
+        .into_iter()
+        .map(|row| ProjectionInput {
+            target_id: row.target_id,
+            vector: row.vector,
+        })
+        .collect::<Vec<_>>();
+    let now = Utc::now().to_rfc3339();
+    let projections = pca_projection(&inputs)
+        .into_iter()
+        .map(|point| db::EmbeddingProjectionRow {
+            id: format!(
+                "projection-{workspace_id}-{scope}-{model_id}-{}-pca-v1",
+                point.target_id
+            ),
+            workspace_id: workspace_id.to_string(),
+            scope: scope.to_string(),
+            target_id: point.target_id,
+            model_id: model_id.to_string(),
+            projection_method: "pca-v1".to_string(),
+            x: point.x,
+            y: point.y,
+            created_at: now.clone(),
         })
         .collect::<Vec<_>>();
 
@@ -3164,12 +3210,20 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
+        let pca_projection_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(1) FROM embedding_projections WHERE workspace_id = ?1 AND scope = 'object' AND model_id = 'clip-vit-b32' AND projection_method = 'pca-v1'",
+                params![overview.id],
+                |row| row.get(0),
+            )
+            .unwrap();
 
         assert_eq!(job.status, "completed");
         assert_eq!(job.processed_items, 1);
         assert_eq!(job.total_items, 1);
         assert_eq!(target_id, "ann-1");
         assert!(blob_len > 0);
+        assert_eq!(pca_projection_count, 1);
 
         let _ = fs::remove_dir_all(parent);
     }
