@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 
 import { Panel } from "../../../components/ui/Panel";
 import {
@@ -52,6 +52,10 @@ function pointDisplayName(point: DatasetMapPoint) {
   }
 
   return `${point.categoryName ?? "Unknown"} in ${point.filename}`;
+}
+
+function pointCategoryLabel(point: DatasetMapPoint) {
+  return point.categoryName || (point.scope === "image" ? "Multiple categories" : "Unknown category");
 }
 
 function deriveImagePoints(points: DatasetMapPoint[]): DatasetMapPoint[] {
@@ -343,19 +347,40 @@ export function DatasetMapPage() {
           </section>
 
           <aside className="dataset-map-selection-panel" aria-label="Selection details">
-            <div>
-              <span className="filter-label">Selection</span>
-              <strong>{selectedPoints.length} selected</strong>
+            <div className="dataset-map-selection-header">
+              <div>
+                <span className="filter-label">Selection</span>
+                <strong>{selectedPoints.length} selected</strong>
+              </div>
+              {selectedPoints.length > 0 ? (
+                <button
+                  className="button button-secondary button-sm"
+                  onClick={() => setSelectedPointIds([])}
+                  type="button"
+                >
+                  Clear
+                </button>
+              ) : null}
             </div>
             {selectedPoints.length > 0 ? (
               <div className="dataset-map-selected-list">
                 {selectedPoints.slice(0, 4).map((point) => (
                   <article className="dataset-map-selected-item" key={point.id}>
-                    <strong>{pointDisplayName(point)}</strong>
-                    <span>{point.sourceName}</span>
+                    <Link
+                      className="dataset-map-selected-filename"
+                      title={point.filename}
+                      to={`/workspace/${workspaceId}/image/${point.imageId}?from=dataset-map`}
+                    >
+                      {point.filename}
+                    </Link>
+                    <span title={pointCategoryLabel(point)}>{pointCategoryLabel(point)}</span>
+                    <span title={point.sourceName}>{point.sourceName}</span>
                     <span>{formatAreaRatio(point)}</span>
                   </article>
                 ))}
+                {selectedPoints.length > 4 ? (
+                  <span className="field-help">Showing 4 of {selectedPoints.length} selected items.</span>
+                ) : null}
               </div>
             ) : (
               <span className="field-help">Select points in the map to review them.</span>
