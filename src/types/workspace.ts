@@ -262,7 +262,7 @@ export type StartExportResult = {
 };
 
 export type DatasetMapScope = "object" | "image";
-export type EmbeddingFamily = "clip" | "dinov2";
+export type EmbeddingFamily = "preview" | "clip" | "dinov2";
 export type EmbeddingRuntimePreference = "auto" | "cuda" | "windows-gpu" | "cpu";
 export type EmbeddingRuntimeBackend = "cuda" | "windows-gpu" | "cpu";
 export type EmbeddingJobStatus =
@@ -326,6 +326,7 @@ export type DatasetMapPoint = {
 
 export type EmbeddingJob = {
   id: string;
+  workspaceId: string;
   scope: DatasetMapScope;
   modelId: string;
   runtimePreference: EmbeddingRuntimePreference;
@@ -345,4 +346,55 @@ export type DatasetMapPayload = {
   runtime: EmbeddingRuntimeProbe;
   points: DatasetMapPoint[];
   jobs: EmbeddingJob[];
+};
+
+export type SamplingMode = "balanced" | "diverse";
+
+export type OutlierMethod = "knn" | "lof";
+
+export type SampleSelectionInput = {
+  workspaceId: string;
+  scope: DatasetMapScope;
+  modelId: string;
+  name: string;
+  targetImages?: number | null;
+  targetRatio?: number | null;
+  mode: SamplingMode;
+  removeOutliers: boolean;
+  outlierMethod?: OutlierMethod | null;
+  outlierPct?: number | null;
+  perClassFloor?: number | null;
+  pcaDim?: number | null;
+  seed?: number | null;
+};
+
+export type SampleSelectionSummary = {
+  sampleSet: string;
+  mode: string;
+  selectedImages: number;
+  selectedObjects: number;
+  excludedOutliers: number;
+  saturated: boolean;
+  seed: number;
+  totalImages: number;
+};
+
+export type SampleSet = {
+  id: string;
+  name: string;
+  scope: DatasetMapScope;
+  modelId: string;
+  mode: string;
+  targetImages?: number | null;
+  targetRatio?: number | null;
+  selectedImages: number;
+  selectedObjects: number;
+  excludedOutliers: number;
+  saturated: boolean;
+  createdAt: string;
+};
+
+export type SampleSetMembers = {
+  imageIds: string[];
+  objectIds: string[];
 };

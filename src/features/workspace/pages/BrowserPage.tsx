@@ -357,7 +357,7 @@ export function BrowserPage() {
         subtitle={`${filteredImages.length} images match the current filters. Showing ${visibleImages.length}.`}
         actions={
           <div className="toolbar-actions">
-            <input className="search-input" onChange={(event) => setSearch(event.target.value)} placeholder="Search filename..." value={search} />
+            <input className="search-input browser-search-input" onChange={(event) => setSearch(event.target.value)} placeholder="Search filename..." value={search} />
             <button className="button button-secondary" onClick={() => setBoxSelectMode((current) => !current)} type="button">
               {boxSelectMode ? "Box Select On" : "Box Select Off"}
             </button>

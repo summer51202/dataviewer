@@ -2,6 +2,7 @@ mod browser;
 mod cvat;
 mod export;
 mod quality;
+mod sampling;
 mod workspace;
 
 pub use browser::{get_browser_payload, get_image_detail};
@@ -12,6 +13,9 @@ pub use cvat::{
 pub use export::{get_export_history, get_export_preview, open_export_folder, start_export};
 pub use quality::{
     get_dataset_map_payload, probe_embedding_runtime, save_dataset_map_reviews, start_embedding_job,
+};
+pub use sampling::{
+    delete_sample_set, get_sample_set_members, list_sample_sets, run_sample_selection,
 };
 pub use workspace::{
     add_source_folder, check_create_workspace_target, create_workspace, get_import_review,

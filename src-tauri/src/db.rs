@@ -7,9 +7,9 @@ use crate::models::{
     AnnotationVersion, BoundingBoxRecord, BoxSummary, BrowserPayload, DatasetMapBbox,
     DatasetMapPoint, DatasetReviewUpdate, ExportAnnotationRecord, ExportConflictItem,
     ExportFilenameConflict, ExportHistoryEntry, ExportImageRecord, ImageCard,
-    ImageDetailPayload, ImportReviewRow, SourceFolder, StoredAnnotationRecord,
-    StoredCategoryRecord, StoredImageRecord, StoredSourceFolder, UnifiedCategory,
-    WorkspaceOverview,
+    ImageDetailPayload, ImportReviewRow, SampleSet, SampleSetMembers, SourceFolder,
+    StoredAnnotationRecord, StoredCategoryRecord, StoredImageRecord, StoredSourceFolder,
+    UnifiedCategory, WorkspaceOverview,
 };
 use crate::paths::APP_VERSION;
 use crate::embedding::jobs::{CropRect, EmbeddingJobItem, EmbeddingRecord, serialize_f32_vector};
@@ -252,6 +252,38 @@ CREATE INDEX IF NOT EXISTS idx_cvat_tasks_workspace_id ON cvat_tasks(workspace_i
 CREATE INDEX IF NOT EXISTS idx_embeddings_workspace_scope_model ON embeddings(workspace_id, scope, model_id);
 CREATE INDEX IF NOT EXISTS idx_embedding_projections_workspace_scope_model ON embedding_projections(workspace_id, scope, model_id);
 CREATE INDEX IF NOT EXISTS idx_dataset_review_marks_workspace_scope ON dataset_review_marks(workspace_id, scope);
+
+CREATE TABLE IF NOT EXISTS sample_sets (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    coverage_method TEXT NOT NULL,
+    params_json TEXT NOT NULL,
+    target_images INTEGER,
+    target_ratio REAL,
+    selected_images INTEGER NOT NULL,
+    selected_objects INTEGER NOT NULL,
+    excluded_outliers INTEGER NOT NULL,
+    saturated INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    UNIQUE(workspace_id, name),
+    FOREIGN KEY(workspace_id) REFERENCES workspace_meta(id)
+);
+
+CREATE TABLE IF NOT EXISTS sample_set_members (
+    id TEXT PRIMARY KEY,
+    sample_set_id TEXT NOT NULL,
+    image_id TEXT NOT NULL,
+    membership TEXT NOT NULL,
+    trigger_object_id TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(sample_set_id, image_id),
+    FOREIGN KEY(sample_set_id) REFERENCES sample_sets(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sample_set_members_set ON sample_set_members(sample_set_id);
 "#;
 
 pub fn initialize_database(db_path: &Path) -> Result<(), String> {
@@ -663,9 +695,10 @@ pub fn read_dataset_map_points(
                         AND p2.model_id = p.model_id
                     ORDER BY
                         CASE p2.projection_method
-                            WHEN 'pca-v1' THEN 0
-                            WHEN 'bootstrap-deterministic' THEN 1
-                            ELSE 2
+                            WHEN 'umap-v1' THEN 0
+                            WHEN 'pca-v1' THEN 1
+                            WHEN 'bootstrap-deterministic' THEN 2
+                            ELSE 3
                         END,
                         p2.created_at DESC
                     LIMIT 1
@@ -878,6 +911,119 @@ pub fn upsert_embedding_projections(
         .commit()
         .map_err(|error| format!("failed to commit embedding projection transaction: {error}"))?;
 
+    Ok(())
+}
+
+pub fn read_sample_sets(db_path: &Path, workspace_id: &str) -> Result<Vec<SampleSet>, String> {
+    let connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT id, name, scope, model_id, coverage_method, target_images, target_ratio,
+                   selected_images, selected_objects, excluded_outliers, saturated, created_at
+            FROM sample_sets
+            WHERE workspace_id = ?1
+            ORDER BY created_at DESC
+            "#,
+        )
+        .map_err(|error| format!("failed to prepare sample set query: {error}"))?;
+
+    let rows = statement
+        .query_map(params![workspace_id], |row| {
+            Ok(SampleSet {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                scope: row.get(2)?,
+                model_id: row.get(3)?,
+                mode: row.get(4)?,
+                target_images: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
+                target_ratio: row.get(6)?,
+                selected_images: row.get::<_, i64>(7)? as u32,
+                selected_objects: row.get::<_, i64>(8)? as u32,
+                excluded_outliers: row.get::<_, i64>(9)? as u32,
+                saturated: row.get::<_, i64>(10)? != 0,
+                created_at: row.get(11)?,
+            })
+        })
+        .map_err(|error| format!("failed to read sample sets: {error}"))?;
+
+    let mut sets = Vec::new();
+    for row in rows {
+        sets.push(row.map_err(|error| format!("failed to map sample set: {error}"))?);
+    }
+    Ok(sets)
+}
+
+pub fn read_sample_set_members(
+    db_path: &Path,
+    workspace_id: &str,
+    name: &str,
+) -> Result<SampleSetMembers, String> {
+    let connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT m.image_id, m.trigger_object_id
+            FROM sample_set_members m
+            JOIN sample_sets s ON s.id = m.sample_set_id
+            WHERE s.workspace_id = ?1 AND s.name = ?2 AND m.membership = 'selected'
+            ORDER BY m.image_id
+            "#,
+        )
+        .map_err(|error| format!("failed to prepare sample set members query: {error}"))?;
+
+    let rows = statement
+        .query_map(params![workspace_id, name], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|error| format!("failed to read sample set members: {error}"))?;
+
+    let mut image_ids = Vec::new();
+    let mut object_ids = Vec::new();
+    for row in rows {
+        let (image_id, object_id) =
+            row.map_err(|error| format!("failed to map sample set member: {error}"))?;
+        image_ids.push(image_id);
+        if let Some(object_id) = object_id {
+            object_ids.push(object_id);
+        }
+    }
+    Ok(SampleSetMembers {
+        image_ids,
+        object_ids,
+    })
+}
+
+pub fn delete_sample_set(db_path: &Path, workspace_id: &str, name: &str) -> Result<(), String> {
+    let mut connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("failed to start delete sample set transaction: {error}"))?;
+
+    transaction
+        .execute(
+            r#"
+            DELETE FROM sample_set_members
+            WHERE sample_set_id IN (
+                SELECT id FROM sample_sets WHERE workspace_id = ?1 AND name = ?2
+            )
+            "#,
+            params![workspace_id, name],
+        )
+        .map_err(|error| format!("failed to delete sample set members: {error}"))?;
+    transaction
+        .execute(
+            "DELETE FROM sample_sets WHERE workspace_id = ?1 AND name = ?2",
+            params![workspace_id, name],
+        )
+        .map_err(|error| format!("failed to delete sample set: {error}"))?;
+
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit delete sample set transaction: {error}"))?;
     Ok(())
 }
 

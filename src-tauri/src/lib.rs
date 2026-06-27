@@ -12,10 +12,11 @@ use commands::{
     get_annotation_versions, get_browser_payload, get_cvat_settings, get_cvat_tasks,
     get_dataset_map_payload, get_export_history, get_export_preview, get_image_detail,
     get_import_review, get_scan_progress, get_source_folders, get_workspace_overview,
-    list_recent_workspaces, open_cvat, open_export_folder, open_workspace, probe_embedding_runtime,
-    remove_recent_workspace, remove_source_folder, rescan_source_folder, save_cvat_settings,
-    save_dataset_map_reviews, save_import_review, start_embedding_job, start_export,
-    sync_cvat_task, test_cvat_settings,
+    delete_sample_set, get_sample_set_members, list_recent_workspaces, list_sample_sets, open_cvat,
+    open_export_folder, open_workspace, probe_embedding_runtime, remove_recent_workspace,
+    remove_source_folder, rescan_source_folder, run_sample_selection, save_cvat_settings,
+    save_dataset_map_reviews, save_import_review, start_embedding_job, start_export, sync_cvat_task,
+    test_cvat_settings,
 };
 
 pub fn run() {
@@ -53,6 +54,10 @@ pub fn run() {
             get_export_history,
             open_export_folder,
             start_export,
+            run_sample_selection,
+            list_sample_sets,
+            delete_sample_set,
+            get_sample_set_members,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run DataViewer shell");

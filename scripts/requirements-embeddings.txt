@@ -1,0 +1,11 @@
+# Python dependencies for scripts/run_generate_embeddings.py
+# Install with: pip install -r scripts/requirements-embeddings.txt
+#
+# torch + open_clip are large (hundreds of MB to ~GB). For a CUDA build,
+# install the matching torch wheel from https://pytorch.org first, then
+# this file. The --mock mode of the script needs none of these (numpy only),
+# which is useful for smoke-testing the full ingest -> embed -> sample chain.
+numpy>=1.23
+pillow>=9.0
+torch>=2.0
+open_clip_torch>=2.20

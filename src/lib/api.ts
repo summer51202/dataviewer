@@ -35,6 +35,10 @@ import {
   RecentWorkspace,
   RemoveSourceFolderInput,
   RescanSourceFolderInput,
+  SampleSelectionInput,
+  SampleSelectionSummary,
+  SampleSet,
+  SampleSetMembers,
   SaveImportReviewInput,
   ScanProgress,
   SourceFolder,
@@ -244,6 +248,7 @@ export async function startEmbeddingJob(input: {
   if (!hasTauriRuntime()) {
     return {
       id: `job-${Date.now()}`,
+      workspaceId: input.workspaceId,
       scope: input.scope,
       modelId: input.modelId,
       runtimePreference: input.runtimePreference,
@@ -271,6 +276,54 @@ export async function saveDatasetMapReviews(input: {
 
   const { invoke } = await import("@tauri-apps/api/core");
   return invoke<typeof input.updates>("save_dataset_map_reviews", { input });
+}
+
+export async function runSampleSelection(input: SampleSelectionInput) {
+  if (!hasTauriRuntime()) {
+    const total = sampleDatasetMapPayload.points.length;
+    const target =
+      input.targetImages ??
+      Math.max(1, Math.round(total * (input.targetRatio ?? 0.3)));
+    const selected = Math.min(target, total);
+    return {
+      sampleSet: input.name,
+      mode: input.mode,
+      selectedImages: selected,
+      selectedObjects: selected,
+      excludedOutliers: input.removeOutliers ? Math.round(total * 0.02) : 0,
+      saturated: selected >= total,
+      seed: input.seed ?? 42,
+      totalImages: total,
+    } satisfies SampleSelectionSummary;
+  }
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<SampleSelectionSummary>("run_sample_selection", { input });
+}
+
+export async function listSampleSets(workspaceId: string) {
+  return invokeOrFallback<SampleSet[]>(
+    "list_sample_sets",
+    { input: { workspaceId } },
+    [],
+  );
+}
+
+export async function deleteSampleSet(workspaceId: string, name: string) {
+  if (!hasTauriRuntime()) {
+    return;
+  }
+
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<void>("delete_sample_set", { input: { workspaceId, name } });
+}
+
+export async function getSampleSetMembers(workspaceId: string, name: string) {
+  return invokeOrFallback<SampleSetMembers>(
+    "get_sample_set_members",
+    { input: { workspaceId, name } },
+    { imageIds: [], objectIds: [] },
+  );
 }
 
 export async function getImageDetail(workspaceId: string, imageId: string) {

@@ -1,4 +1,4 @@
-﻿use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -10,33 +10,33 @@ use chrono::Utc;
 use crate::cvat_api;
 use crate::db::{self, DatasetMapExportExclusions};
 use crate::embedding::jobs::{
-    batch_size_for_backend, deterministic_embedding_for_item, EmbeddingRecord,
+    batch_size_for_backend, l2_normalize_vector, EmbeddingJobItem, EmbeddingRecord,
 };
-use crate::embedding::projection::{
-    deterministic_projection, pca_projection, ProjectionInput,
-};
-use crate::embedding::providers::smoke_test_session;
+use crate::embedding::preprocess::preprocess_item_from_rgb;
+use crate::embedding::projection::{deterministic_projection, pca_projection, ProjectionInput};
+use crate::embedding::providers::load_embedding_provider;
 use crate::embedding::runtime::{
     default_model_registry, probe_runtime, resolve_model_asset, RuntimeBackend,
 };
 use crate::models::{
-    AddSourceFolderInput, AnnotationVersion, BrowserPayload, CreateWorkspaceInput,
-    CreateCvatTaskInput, CvatSettings, CvatTask, DatasetMapPayload, DatasetMapPayloadInput,
+    AddSourceFolderInput, AnnotationVersion, BrowserPayload, CreateCvatTaskInput,
+    CreateWorkspaceInput, CvatSettings, CvatTask, DatasetMapPayload, DatasetMapPayloadInput,
     DatasetMapReviewInput, DatasetReviewUpdate, EmbeddingJob, EmbeddingJobInput,
     EmbeddingModelOption, EmbeddingRuntimeCapability, EmbeddingRuntimeProbe,
     EmbeddingRuntimeProbeInput, ExportHistoryEntry, ExportImageRecord, ExportPreviewInput,
     ImageDetailPayload, ImportReviewRow, OpenCvatInput, OpenWorkspaceInput, RecentWorkspace,
-    RemoveSourceFolderInput, RescanSourceFolderInput, SaveImportReviewInput, ScanProgress,
-    SourceFolder, StartExportInput, StartExportResult,
-    StoredAnnotationRecord, StoredCategoryRecord, StoredImageRecord,
-    SyncCvatTaskInput, WorkspaceCreateTargetCheck, WorkspaceManifest, WorkspaceOverview,
+    RemoveSourceFolderInput, RescanSourceFolderInput, SaveImportReviewInput, SampleSelectionInput,
+    SampleSelectionSummary, SampleSet, SampleSetListInput, SampleSetMembers, SampleSetMembersInput,
+    DeleteSampleSetInput, ScanProgress, SourceFolder, StartExportInput, StartExportResult,
+    StoredAnnotationRecord, StoredCategoryRecord, StoredImageRecord, SyncCvatTaskInput,
+    WorkspaceCreateTargetCheck, WorkspaceManifest, WorkspaceOverview,
 };
-use crate::paths::{
-    build_workspace_paths, recent_workspaces_path, APP_VERSION, SCHEMA_VERSION,
-};
+use crate::paths::{build_workspace_paths, recent_workspaces_path, APP_VERSION, SCHEMA_VERSION};
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "bmp", "webp", "tif", "tiff"];
 static ACTIVE_SCANS: LazyLock<Mutex<HashMap<String, Vec<ScanProgress>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static EMBEDDING_JOBS: LazyLock<Mutex<HashMap<String, EmbeddingJob>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub fn create_workspace(input: CreateWorkspaceInput) -> Result<WorkspaceOverview, String> {
@@ -95,7 +95,9 @@ pub fn open_workspace(input: OpenWorkspaceInput) -> Result<WorkspaceOverview, St
     Ok(overview)
 }
 
-pub fn check_create_workspace_target(input: CreateWorkspaceInput) -> Result<WorkspaceCreateTargetCheck, String> {
+pub fn check_create_workspace_target(
+    input: CreateWorkspaceInput,
+) -> Result<WorkspaceCreateTargetCheck, String> {
     let trimmed_name = input.name.trim();
     let root = resolve_workspace_creation_root(trimmed_name, &input.parent_path)?;
     let paths = build_workspace_paths(&root);
@@ -206,7 +208,11 @@ pub fn list_recent_workspaces() -> Result<Vec<RecentWorkspace>, String> {
     for item in &mut items {
         let is_available = PathBuf::from(&item.workspace_path).exists();
         item.available = is_available;
-        item.health_status = if is_available { "healthy".into() } else { "warning".into() };
+        item.health_status = if is_available {
+            "healthy".into()
+        } else {
+            "warning".into()
+        };
     }
 
     items.sort_by(|a, b| b.last_opened_at.cmp(&a.last_opened_at));
@@ -270,8 +276,12 @@ pub fn load_dataset_map_payload_by_id(
         .model_id
         .clone()
         .filter(|id| models.iter().any(|model| model.id == *id))
-        .unwrap_or_else(|| "clip-vit-b32".to_string());
+        .unwrap_or_else(|| "fast-preview".to_string());
+    if model_id == "fast-preview" {
+        generate_bootstrap_embedding_projections(&paths.db_path, &workspace_id, &scope, &model_id)?;
+    }
     let points = db::read_dataset_map_points(&paths.db_path, &workspace_id, &scope, &model_id)?;
+    let jobs = current_embedding_jobs(&workspace_id);
 
     Ok(DatasetMapPayload {
         workspace_id,
@@ -280,7 +290,7 @@ pub fn load_dataset_map_payload_by_id(
         models,
         runtime: default_embedding_runtime_probe("auto"),
         points,
-        jobs: vec![],
+        jobs,
     })
 }
 
@@ -292,49 +302,147 @@ pub fn probe_embedding_runtime_by_id(
 
 pub fn start_embedding_job_by_id(input: EmbeddingJobInput) -> Result<EmbeddingJob, String> {
     let paths = resolve_workspace_paths_by_id(&input.workspace_id)?;
+    if input.model_id == "fast-preview" {
+        let total_items = db::read_dataset_map_projection_targets(
+            &paths.db_path,
+            &input.workspace_id,
+            &input.scope,
+        )?
+        .len() as u32;
+        update_embedding_progress(
+            &input.workspace_id,
+            &input.scope,
+            &input.model_id,
+            "running",
+            "Generating preview layout",
+            0,
+            total_items,
+            None,
+            &input.runtime_preference,
+        );
+        let processed_items = generate_bootstrap_embedding_projections(
+            &paths.db_path,
+            &input.workspace_id,
+            &input.scope,
+            &input.model_id,
+        )?;
+        let job = EmbeddingJob {
+            id: embedding_job_key(&input.workspace_id, &input.scope, &input.model_id),
+            workspace_id: input.workspace_id,
+            scope: input.scope,
+            model_id: input.model_id,
+            runtime_preference: input.runtime_preference,
+            runtime_backend: None,
+            status: "completed".to_string(),
+            processed_items,
+            total_items: processed_items,
+            message: Some(format!(
+                "Generated {processed_items} preview points without model inference."
+            )),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        set_embedding_progress(job.clone());
+        return Ok(job);
+    }
     let model_asset = resolve_model_asset(&paths.root, &input.model_id);
-    let smoke = smoke_test_session(&model_asset);
     let probe = probe_runtime(&input.runtime_preference);
     let runtime_backend = probe.selected_backend;
-    let batch_size = batch_size_for_backend(runtime_backend);
-    let embedding_dim = default_model_registry()
+    eprintln!(
+        "[dataset-map] embedding job start workspace={} scope={} model={} runtime={} model_path={}",
+        input.workspace_id,
+        input.scope,
+        input.model_id,
+        runtime_backend.as_str(),
+        model_asset.display()
+    );
+    update_embedding_progress(
+        &input.workspace_id,
+        &input.scope,
+        &input.model_id,
+        "running",
+        "Loading model",
+        0,
+        0,
+        Some(runtime_backend.as_str().to_string()),
+        &input.runtime_preference,
+    );
+    let model = default_model_registry()
         .into_iter()
         .find(|model| model.id == input.model_id)
-        .map(|model| model.embedding_dim as usize)
-        .unwrap_or(512);
+        .ok_or_else(|| format!("unsupported embedding model '{}'", input.model_id))?;
+    eprintln!("[dataset-map] loading ONNX provider");
+    let (_session, mut provider) = load_embedding_provider(&model, runtime_backend, &model_asset)?;
+    eprintln!("[dataset-map] ONNX provider loaded");
+    let batch_size = batch_size_for_backend(runtime_backend);
     let items = db::read_embedding_job_items(&paths.db_path, &input.workspace_id, &input.scope)?;
+    update_embedding_progress(
+        &input.workspace_id,
+        &input.scope,
+        &input.model_id,
+        "running",
+        "Running inference",
+        0,
+        items.len() as u32,
+        Some(runtime_backend.as_str().to_string()),
+        &input.runtime_preference,
+    );
+    eprintln!(
+        "[dataset-map] loaded {} embedding inputs; batch_size={batch_size}",
+        items.len()
+    );
     let now = Utc::now().to_rfc3339();
-    let records = items
-        .iter()
-        .map(|item| EmbeddingRecord {
-            workspace_id: input.workspace_id.clone(),
-            scope: input.scope.clone(),
-            target_id: item.target_id.clone(),
-            image_id: item.image_id.clone(),
-            annotation_id: item.annotation_id.clone(),
-            model_id: input.model_id.clone(),
-            runtime_backend: runtime_backend.as_str().to_string(),
-            vector: deterministic_embedding_for_item(item, &input.model_id, embedding_dim),
-            created_at: now.clone(),
-        })
-        .collect::<Vec<_>>();
+    let records = run_embedding_batches(
+        &items,
+        &model,
+        &mut *provider,
+        batch_size,
+        &input.workspace_id,
+        &input.scope,
+        &input.model_id,
+        runtime_backend.as_str(),
+        &input.runtime_preference,
+        &now,
+    )?;
+    update_embedding_progress(
+        &input.workspace_id,
+        &input.scope,
+        &input.model_id,
+        "running",
+        "Writing embeddings",
+        records.len() as u32,
+        records.len() as u32,
+        Some(runtime_backend.as_str().to_string()),
+        &input.runtime_preference,
+    );
+    eprintln!(
+        "[dataset-map] generated {} embedding records; writing DB",
+        records.len()
+    );
     db::upsert_embeddings(&paths.db_path, &records)?;
-    generate_bootstrap_embedding_projections(
+    eprintln!("[dataset-map] embeddings written; generating projections");
+    update_embedding_progress(
+        &input.workspace_id,
+        &input.scope,
+        &input.model_id,
+        "running",
+        "Generating UMAP projection",
+        records.len() as u32,
+        records.len() as u32,
+        Some(runtime_backend.as_str().to_string()),
+        &input.runtime_preference,
+    );
+    let projection_items = generate_umap_embedding_projections(
         &paths.db_path,
         &input.workspace_id,
         &input.scope,
         &input.model_id,
     )?;
-    let pca_items = generate_pca_embedding_projections(
-        &paths.db_path,
-        &input.workspace_id,
-        &input.scope,
-        &input.model_id,
-    )?;
+    eprintln!("[dataset-map] projections generated; job completed");
     let processed_items = records.len() as u32;
 
-    Ok(EmbeddingJob {
-        id: format!("embedding-job-{}", Utc::now().timestamp_millis()),
+    let job = EmbeddingJob {
+        id: embedding_job_key(&input.workspace_id, &input.scope, &input.model_id),
+        workspace_id: input.workspace_id,
         scope: input.scope,
         model_id: input.model_id,
         runtime_preference: input.runtime_preference,
@@ -343,11 +451,155 @@ pub fn start_embedding_job_by_id(input: EmbeddingJobInput) -> Result<EmbeddingJo
         processed_items,
         total_items: processed_items,
         message: Some(format!(
-            "{} Stored {processed_items} embedding vectors with batch size {batch_size}; generated {pca_items} PCA projections with deterministic bootstrap fallback.",
-            smoke.detail,
+            "Stored {processed_items} embedding vectors with batch size {batch_size}; generated {projection_items} projections.",
         )),
         updated_at: Utc::now().to_rfc3339(),
-    })
+    };
+    set_embedding_progress(job.clone());
+    Ok(job)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_embedding_batches(
+    items: &[EmbeddingJobItem],
+    model: &crate::embedding::runtime::EmbeddingModelDefinition,
+    provider: &mut dyn crate::embedding::providers::EmbeddingProvider,
+    batch_size: usize,
+    workspace_id: &str,
+    scope: &str,
+    model_id: &str,
+    runtime_backend: &str,
+    runtime_preference: &str,
+    created_at: &str,
+) -> Result<Vec<EmbeddingRecord>, String> {
+    let mut records = Vec::with_capacity(items.len());
+    let total_items = items.len() as u32;
+    for (batch_index, batch) in items.chunks(batch_size.max(1)).enumerate() {
+        eprintln!(
+            "[dataset-map] batch {} preprocess start ({} items)",
+            batch_index + 1,
+            batch.len()
+        );
+        let mut input_values = Vec::<f32>::new();
+        let mut batch_shape: Option<[usize; 4]> = None;
+        let mut image_cache = HashMap::<String, image::RgbImage>::new();
+        for item in batch {
+            if !image_cache.contains_key(&item.original_path) {
+                let image = image::open(&item.original_path)
+                    .map_err(|error| {
+                        format!("failed to decode image '{}': {error}", item.original_path)
+                    })?
+                    .to_rgb8();
+                image_cache.insert(item.original_path.clone(), image);
+            }
+            let image = image_cache
+                .get(&item.original_path)
+                .ok_or_else(|| format!("failed to cache image '{}'", item.original_path))?;
+            let tensor = preprocess_item_from_rgb(image, item, model)?;
+            let current_shape = tensor.shape;
+            if let Some(shape) = batch_shape {
+                if shape[1..] != current_shape[1..] {
+                    return Err(format!(
+                        "preprocessed tensor shape mismatch: expected {:?}, got {:?}",
+                        shape, current_shape
+                    ));
+                }
+            } else {
+                batch_shape = Some(current_shape);
+            }
+            input_values.extend(tensor.values);
+        }
+
+        let mut shape =
+            batch_shape.unwrap_or([0, 3, model.input_size as usize, model.input_size as usize]);
+        shape[0] = batch.len();
+        eprintln!(
+            "[dataset-map] batch {} ONNX run start shape={shape:?}",
+            batch_index + 1
+        );
+        let vectors =
+            run_provider_batch_with_fallback(provider, shape, &input_values, batch.len())?;
+        eprintln!(
+            "[dataset-map] batch {} ONNX run complete ({} vectors)",
+            batch_index + 1,
+            vectors.len()
+        );
+        if vectors.len() != batch.len() {
+            return Err(format!(
+                "provider returned {} embedding rows for {} inputs",
+                vectors.len(),
+                batch.len()
+            ));
+        }
+
+        records.extend(batch.iter().zip(vectors.into_iter()).map(|(item, vector)| {
+            EmbeddingRecord {
+                workspace_id: workspace_id.to_string(),
+                scope: scope.to_string(),
+                target_id: item.target_id.clone(),
+                image_id: item.image_id.clone(),
+                annotation_id: item.annotation_id.clone(),
+                model_id: model_id.to_string(),
+                runtime_backend: runtime_backend.to_string(),
+                vector: l2_normalize_vector(vector),
+                created_at: created_at.to_string(),
+            }
+        }));
+        update_embedding_progress(
+            workspace_id,
+            scope,
+            model_id,
+            "running",
+            "Running inference",
+            records.len() as u32,
+            total_items,
+            Some(runtime_backend.to_string()),
+            runtime_preference,
+        );
+    }
+
+    Ok(records)
+}
+
+fn run_provider_batch_with_fallback(
+    provider: &mut dyn crate::embedding::providers::EmbeddingProvider,
+    shape: [usize; 4],
+    input_values: &[f32],
+    batch_len: usize,
+) -> Result<Vec<Vec<f32>>, String> {
+    if batch_len <= 1 {
+        return provider.run_batch(shape, input_values, batch_len);
+    }
+
+    match provider.run_batch(shape, input_values, batch_len) {
+        Ok(vectors) => Ok(vectors),
+        Err(batch_error) => {
+            eprintln!(
+                "[dataset-map] batch inference failed for {batch_len} items; retrying one item at a time: {batch_error}"
+            );
+            let item_stride = shape[1]
+                .checked_mul(shape[2])
+                .and_then(|value| value.checked_mul(shape[3]))
+                .ok_or_else(|| {
+                    "ONNX input shape overflow while falling back to single-item inference"
+                        .to_string()
+                })?;
+            if input_values.len() != item_stride * batch_len {
+                return Err(format!(
+                    "batched ONNX input length mismatch: expected {}, got {}",
+                    item_stride * batch_len,
+                    input_values.len()
+                ));
+            }
+            let single_shape = [1, shape[1], shape[2], shape[3]];
+            let mut vectors = Vec::with_capacity(batch_len);
+            for values in input_values.chunks_exact(item_stride) {
+                let mut single_vectors = provider.run_batch(single_shape, values, 1)?;
+                vectors.append(&mut single_vectors);
+            }
+            Ok(vectors)
+        }
+    }
 }
 
 pub fn save_dataset_map_reviews_by_id(
@@ -367,21 +619,78 @@ pub fn save_dataset_map_reviews_by_id(
 }
 
 fn default_embedding_models(workspace_root: &Path) -> Vec<EmbeddingModelOption> {
-    default_model_registry()
-        .into_iter()
-        .map(|model| {
-            let asset_available = resolve_model_asset(workspace_root, &model.id).exists();
-            EmbeddingModelOption {
-                id: model.id,
-                family: model.family,
-                display_name: model.display_name,
-                embedding_dim: model.embedding_dim,
-                input_size: model.input_size,
-                available: asset_available,
-                download_required: !asset_available,
-            }
+    std::iter::once(EmbeddingModelOption {
+        id: "fast-preview".to_string(),
+        family: "preview".to_string(),
+        display_name: "Fast Preview (No Model)".to_string(),
+        embedding_dim: 2,
+        input_size: 0,
+        available: true,
+        download_required: false,
+    })
+    .chain(default_model_registry().into_iter().map(|model| {
+        let asset_available = resolve_model_asset(workspace_root, &model.id).exists();
+        EmbeddingModelOption {
+            id: model.id,
+            family: model.family,
+            display_name: model.display_name,
+            embedding_dim: model.embedding_dim,
+            input_size: model.input_size,
+            available: asset_available,
+            download_required: !asset_available,
+        }
+    }))
+    .collect()
+}
+
+fn embedding_job_key(workspace_id: &str, scope: &str, model_id: &str) -> String {
+    format!("{workspace_id}:{scope}:{model_id}")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_embedding_progress(
+    workspace_id: &str,
+    scope: &str,
+    model_id: &str,
+    status: &str,
+    message: &str,
+    processed_items: u32,
+    total_items: u32,
+    runtime_backend: Option<String>,
+    runtime_preference: &str,
+) {
+    let job = EmbeddingJob {
+        id: embedding_job_key(workspace_id, scope, model_id),
+        workspace_id: workspace_id.to_string(),
+        scope: scope.to_string(),
+        model_id: model_id.to_string(),
+        runtime_preference: runtime_preference.to_string(),
+        runtime_backend,
+        status: status.to_string(),
+        processed_items,
+        total_items,
+        message: Some(message.to_string()),
+        updated_at: Utc::now().to_rfc3339(),
+    };
+    set_embedding_progress(job);
+}
+
+fn set_embedding_progress(job: EmbeddingJob) {
+    if let Ok(mut jobs) = EMBEDDING_JOBS.lock() {
+        jobs.insert(job.id.clone(), job);
+    }
+}
+
+fn current_embedding_jobs(workspace_id: &str) -> Vec<EmbeddingJob> {
+    EMBEDDING_JOBS
+        .lock()
+        .map(|jobs| {
+            jobs.values()
+                .filter(|job| job.workspace_id == workspace_id)
+                .cloned()
+                .collect()
         })
-        .collect()
+        .unwrap_or_default()
 }
 
 fn default_embedding_runtime_probe(preference: &str) -> EmbeddingRuntimeProbe {
@@ -413,6 +722,336 @@ fn default_embedding_runtime_probe(preference: &str) -> EmbeddingRuntimeProbe {
         ],
         fallback_reason: probe.fallback_reason,
     }
+}
+
+/// Locate a Python executable that has `umap` importable.
+/// Search order:
+///   1. `python` in PATH
+///   2. `python3` in PATH
+/// Returns the executable name/path if found, None otherwise.
+static UMAP_PYTHON: LazyLock<Option<String>> = LazyLock::new(|| {
+    for candidate in &["python", "python3"] {
+        let ok = Command::new(candidate)
+            .args(["-c", "import umap"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return Some((*candidate).to_string());
+        }
+    }
+    None
+});
+
+fn find_umap_python() -> Option<&'static str> {
+    UMAP_PYTHON.as_deref()
+}
+
+/// Resolve the path to `run_umap_projection.py` by searching relative to the
+/// current executable (works for both dev and packaged builds).
+fn resolve_umap_script() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    // Walk up from the exe dir looking for scripts/run_umap_projection.py.
+    // Dev:        target/debug/dataviewer.exe  → ../../.. → project root
+    // Packaged:   app.exe (same dir as scripts)
+    let mut dir = exe.parent()?;
+    for _ in 0..6 {
+        let candidate = dir.join("scripts").join("run_umap_projection.py");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        dir = dir.parent()?;
+    }
+    None
+}
+
+/// Run UMAP projection via the Python script and write results to the DB.
+/// Falls back to PCA when Python or the script cannot be found.
+fn generate_umap_embedding_projections(
+    db_path: &Path,
+    workspace_id: &str,
+    scope: &str,
+    model_id: &str,
+) -> Result<u32, String> {
+    let python = match find_umap_python() {
+        Some(p) => p,
+        None => {
+            eprintln!("[dataset-map] umap-capable Python not found; falling back to PCA");
+            return generate_pca_embedding_projections(db_path, workspace_id, scope, model_id);
+        }
+    };
+
+    let script = match resolve_umap_script() {
+        Some(p) => p,
+        None => {
+            eprintln!("[dataset-map] run_umap_projection.py not found; falling back to PCA");
+            return generate_pca_embedding_projections(db_path, workspace_id, scope, model_id);
+        }
+    };
+
+    // Problem 5: reject non-UTF-8 paths early with a clear message
+    let db_path_str = match db_path.to_str() {
+        Some(s) => s,
+        None => {
+            eprintln!("[dataset-map] db path is not valid UTF-8; falling back to PCA");
+            return generate_pca_embedding_projections(db_path, workspace_id, scope, model_id);
+        }
+    };
+    let script_str = match script.to_str() {
+        Some(s) => s,
+        None => {
+            eprintln!("[dataset-map] script path is not valid UTF-8; falling back to PCA");
+            return generate_pca_embedding_projections(db_path, workspace_id, scope, model_id);
+        }
+    };
+
+    eprintln!(
+        "[dataset-map] running UMAP via {} {:?}",
+        python,
+        script.display()
+    );
+
+    // Problem 2: spawn failure also falls back to PCA instead of propagating
+    let output = match Command::new(python)
+        .args([
+            script_str,
+            "--db-path",
+            db_path_str,
+            "--workspace-id",
+            workspace_id,
+            "--scope",
+            scope,
+            "--model-id",
+            model_id,
+        ])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("[dataset-map] failed to spawn umap script: {e}; falling back to PCA");
+            return generate_pca_embedding_projections(db_path, workspace_id, scope, model_id);
+        }
+    };
+
+    // Forward Python stderr for visibility in Tauri logs
+    if !output.stderr.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for line in stderr.lines() {
+            eprintln!("[umap] {line}");
+        }
+    }
+
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        eprintln!("[dataset-map] umap script exited {code}; falling back to PCA");
+        return generate_pca_embedding_projections(db_path, workspace_id, scope, model_id);
+    }
+
+    // Parse the JSON summary from stdout to get the projected count
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let projected: u32 = stdout
+        .trim()
+        .parse::<serde_json::Value>()
+        .ok()
+        .and_then(|v| v.get("projected")?.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(0);
+
+    eprintln!("[dataset-map] UMAP projection complete: {projected} points");
+    Ok(projected)
+}
+
+/// Locate a Python executable that has numpy + scikit-learn importable.
+/// Probed once per process. Sampling has no Rust fallback by design.
+static SAMPLING_PYTHON: LazyLock<Option<String>> = LazyLock::new(|| {
+    for candidate in &["python", "python3"] {
+        let ok = Command::new(candidate)
+            .args(["-c", "import numpy, sklearn"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return Some((*candidate).to_string());
+        }
+    }
+    None
+});
+
+fn find_sampling_python() -> Option<&'static str> {
+    SAMPLING_PYTHON.as_deref()
+}
+
+fn resolve_sample_selection_script() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let mut dir = exe.parent()?;
+    for _ in 0..6 {
+        let candidate = dir.join("scripts").join("run_sample_selection.py");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        dir = dir.parent()?;
+    }
+    None
+}
+
+/// Run coverage-maximising sample selection via the Python CLI and return its
+/// summary. Unlike UMAP, there is no Rust fallback: if Python or the script is
+/// unavailable we return a clear error rather than silently degrading.
+pub fn run_sample_selection_by_id(
+    input: SampleSelectionInput,
+) -> Result<SampleSelectionSummary, String> {
+    let paths = resolve_workspace_paths_by_id(&input.workspace_id)?;
+
+    if input.target_images.is_none() && input.target_ratio.is_none() {
+        return Err("either targetImages or targetRatio is required".to_string());
+    }
+
+    let python = find_sampling_python().ok_or_else(|| {
+        "Python with numpy + scikit-learn not found; install scripts/requirements-sampling.txt"
+            .to_string()
+    })?;
+    let script = resolve_sample_selection_script()
+        .ok_or_else(|| "run_sample_selection.py not found alongside the app".to_string())?;
+
+    let db_path_str = paths
+        .db_path
+        .to_str()
+        .ok_or_else(|| "workspace db path is not valid UTF-8".to_string())?;
+    let script_str = script
+        .to_str()
+        .ok_or_else(|| "sample selection script path is not valid UTF-8".to_string())?;
+
+    let mut args: Vec<String> = vec![
+        script_str.to_string(),
+        "--db-path".into(),
+        db_path_str.to_string(),
+        "--workspace-id".into(),
+        input.workspace_id.clone(),
+        "--scope".into(),
+        input.scope.clone(),
+        "--model-id".into(),
+        input.model_id.clone(),
+        "--name".into(),
+        input.name.clone(),
+        "--mode".into(),
+        input.mode.clone(),
+    ];
+    if let Some(n) = input.target_images {
+        args.push("--target-images".into());
+        args.push(n.to_string());
+    } else if let Some(r) = input.target_ratio {
+        args.push("--target-ratio".into());
+        args.push(r.to_string());
+    }
+    if input.remove_outliers {
+        args.push("--remove-outliers".into());
+        if let Some(m) = &input.outlier_method {
+            args.push("--outlier-method".into());
+            args.push(m.clone());
+        }
+        if let Some(p) = input.outlier_pct {
+            args.push("--outlier-pct".into());
+            args.push(p.to_string());
+        }
+    }
+    if let Some(f) = input.per_class_floor {
+        args.push("--per-class-floor".into());
+        args.push(f.to_string());
+    }
+    if let Some(d) = input.pca_dim {
+        args.push("--pca-dim".into());
+        args.push(d.to_string());
+    }
+    if let Some(s) = input.seed {
+        args.push("--seed".into());
+        args.push(s.to_string());
+    }
+
+    eprintln!(
+        "[dataset-map] running sample selection via {python} {:?}",
+        script.display()
+    );
+    let output = Command::new(python)
+        .args(&args)
+        .output()
+        .map_err(|e| format!("failed to spawn sample selection script: {e}"))?;
+
+    let stderr_text = String::from_utf8_lossy(&output.stderr);
+    if !stderr_text.is_empty() {
+        for line in stderr_text.lines() {
+            eprintln!("[sample] {line}");
+        }
+    }
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        // Surface the most relevant stderr line (prefer an explicit ERROR line)
+        let detail = stderr_text
+            .lines()
+            .rev()
+            .find(|l| l.contains("ERROR"))
+            .or_else(|| stderr_text.lines().rev().find(|l| !l.trim().is_empty()))
+            .map(|l| l.trim().to_string())
+            .unwrap_or_default();
+        if detail.is_empty() {
+            return Err(format!("sample selection failed (exit {code})"));
+        }
+        return Err(format!("sample selection failed (exit {code}): {detail}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let last = stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .ok_or_else(|| "sample selection produced no output".to_string())?;
+
+    // The Python CLI emits snake_case JSON; the public summary is camelCase
+    // (for the frontend), so parse via a snake_case intermediate then map.
+    #[derive(serde::Deserialize)]
+    struct RawSampleSummary {
+        sample_set: String,
+        mode: String,
+        selected_images: u32,
+        selected_objects: u32,
+        excluded_outliers: u32,
+        saturated: bool,
+        seed: u32,
+        total_images: u32,
+    }
+
+    let raw = serde_json::from_str::<RawSampleSummary>(last.trim())
+        .map_err(|e| format!("failed to parse sample selection output: {e}"))?;
+    Ok(SampleSelectionSummary {
+        sample_set: raw.sample_set,
+        mode: raw.mode,
+        selected_images: raw.selected_images,
+        selected_objects: raw.selected_objects,
+        excluded_outliers: raw.excluded_outliers,
+        saturated: raw.saturated,
+        seed: raw.seed,
+        total_images: raw.total_images,
+    })
+}
+
+pub fn list_sample_sets_by_id(input: SampleSetListInput) -> Result<Vec<SampleSet>, String> {
+    let paths = resolve_workspace_paths_by_id(&input.workspace_id)?;
+    db::read_sample_sets(&paths.db_path, &input.workspace_id)
+}
+
+pub fn delete_sample_set_by_id(input: DeleteSampleSetInput) -> Result<(), String> {
+    let paths = resolve_workspace_paths_by_id(&input.workspace_id)?;
+    db::delete_sample_set(&paths.db_path, &input.workspace_id, &input.name)
+}
+
+pub fn get_sample_set_members_by_id(
+    input: SampleSetMembersInput,
+) -> Result<SampleSetMembers, String> {
+    let paths = resolve_workspace_paths_by_id(&input.workspace_id)?;
+    db::read_sample_set_members(&paths.db_path, &input.workspace_id, &input.name)
 }
 
 fn generate_bootstrap_embedding_projections(
@@ -456,7 +1095,8 @@ fn generate_pca_embedding_projections(
     scope: &str,
     model_id: &str,
 ) -> Result<u32, String> {
-    let vectors = db::read_embedding_vectors_for_projection(db_path, workspace_id, scope, model_id)?;
+    let vectors =
+        db::read_embedding_vectors_for_projection(db_path, workspace_id, scope, model_id)?;
     let inputs = vectors
         .into_iter()
         .map(|row| ProjectionInput {
@@ -488,10 +1128,13 @@ fn generate_pca_embedding_projections(
     Ok(projections.len() as u32)
 }
 
-pub fn load_export_preview_by_id(input: ExportPreviewInput) -> Result<crate::models::ExportPreview, String> {
+pub fn load_export_preview_by_id(
+    input: ExportPreviewInput,
+) -> Result<crate::models::ExportPreview, String> {
     let paths = resolve_workspace_paths_by_id(&input.workspace_id)?;
     let overview = db::read_workspace_overview(&paths.db_path)?;
-    let output_path = normalize_path_string(&paths.exports_dir.join(format!("{}-coco", overview.name)));
+    let output_path =
+        normalize_path_string(&paths.exports_dir.join(format!("{}-coco", overview.name)));
     let browser_payload = db::read_browser_payload(&paths.db_path)?;
     let all_export_images = db::read_export_images(&paths.db_path)?;
     let filtered_images = filter_export_images(
@@ -540,13 +1183,17 @@ pub fn start_export(input: StartExportInput) -> Result<StartExportResult, String
     }
     let conflicts = collect_export_conflicts(&images, &browser_payload);
     if !conflicts.is_empty() && !input.allow_auto_rename_conflicts {
-        return Err("filename conflicts detected; review conflicts and enable auto rename before exporting".into());
+        return Err(
+            "filename conflicts detected; review conflicts and enable auto rename before exporting"
+                .into(),
+        );
     }
 
     if images.is_empty() {
-        return Err("no annotated images are available for export under the current filters".into());
+        return Err(
+            "no annotated images are available for export under the current filters".into(),
+        );
     }
-
 
     sort_images_for_seed(&mut images, input.random_seed);
     let split = compute_split_counts(
@@ -626,7 +1273,9 @@ pub fn load_cvat_tasks_by_id(workspace_id: &str) -> Result<Vec<CvatTask>, String
         .collect())
 }
 
-pub fn load_annotation_versions_by_id(workspace_id: &str) -> Result<Vec<AnnotationVersion>, String> {
+pub fn load_annotation_versions_by_id(
+    workspace_id: &str,
+) -> Result<Vec<AnnotationVersion>, String> {
     let paths = resolve_workspace_paths_by_id(workspace_id)?;
     db::read_annotation_versions(&paths.db_path)
 }
@@ -642,7 +1291,9 @@ pub fn create_cvat_task(input: CreateCvatTaskInput) -> Result<Vec<CvatTask>, Str
         return Err("selected images are not available in this workspace".into());
     }
     if selected_images.iter().any(|image| image.4 != "unannotated") {
-        return Err("only unannotated images can be staged for CVAT in the current workflow".into());
+        return Err(
+            "only unannotated images can be staged for CVAT in the current workflow".into(),
+        );
     }
 
     let task_id = format!("cvat-task-{}", Utc::now().timestamp_millis());
@@ -678,9 +1329,8 @@ pub fn create_cvat_task(input: CreateCvatTaskInput) -> Result<Vec<CvatTask>, Str
 
         let safe_name = make_unique_file_name(&file_name, &mut used_names);
         let destination = task_images_dir.join(&safe_name);
-        fs::copy(&source_path, &destination).map_err(|error| {
-            format!("failed to stage selected image for CVAT task: {error}")
-        })?;
+        fs::copy(&source_path, &destination)
+            .map_err(|error| format!("failed to stage selected image for CVAT task: {error}"))?;
         staged_image_paths.push(destination.clone());
         manifest_images.push(serde_json::json!({
             "imageId": image_id,
@@ -711,7 +1361,11 @@ pub fn create_cvat_task(input: CreateCvatTaskInput) -> Result<Vec<CvatTask>, Str
     .map_err(|error| format!("failed to write CVAT task manifest: {error}"))?;
 
     let settings = load_optional_cvat_settings(&paths)?;
-    let initial_status = if settings.is_some() { "Connecting" } else { "Prepared" };
+    let initial_status = if settings.is_some() {
+        "Connecting"
+    } else {
+        "Prepared"
+    };
     let project_name = if settings.is_some() {
         "remote-cvat".to_string()
     } else {
@@ -738,7 +1392,13 @@ pub fn create_cvat_task(input: CreateCvatTaskInput) -> Result<Vec<CvatTask>, Str
         let remote = match cvat_api::create_task(&settings, &task_name, &labels) {
             Ok(remote) => remote,
             Err(error) => {
-                let _ = db::update_cvat_task_remote_info(&paths.db_path, &task_id, "Remote Error", None, None);
+                let _ = db::update_cvat_task_remote_info(
+                    &paths.db_path,
+                    &task_id,
+                    "Remote Error",
+                    None,
+                    None,
+                );
                 return Err(error);
             }
         };
@@ -751,8 +1411,13 @@ pub fn create_cvat_task(input: CreateCvatTaskInput) -> Result<Vec<CvatTask>, Str
             Some(&remote.remote_url),
         )?;
 
-        let staged_refs = staged_image_paths.iter().map(PathBuf::as_path).collect::<Vec<_>>();
-        if let Err(error) = cvat_api::upload_task_images(&settings, remote.remote_task_id, &staged_refs) {
+        let staged_refs = staged_image_paths
+            .iter()
+            .map(PathBuf::as_path)
+            .collect::<Vec<_>>();
+        if let Err(error) =
+            cvat_api::upload_task_images(&settings, remote.remote_task_id, &staged_refs)
+        {
             let _ = db::update_cvat_task_remote_info(
                 &paths.db_path,
                 &task_id,
@@ -777,10 +1442,12 @@ pub fn create_cvat_task(input: CreateCvatTaskInput) -> Result<Vec<CvatTask>, Str
 
 pub fn get_cvat_settings_by_id(workspace_id: &str) -> Result<CvatSettings, String> {
     let paths = resolve_workspace_paths_by_id(workspace_id)?;
-    Ok(load_optional_cvat_settings(&paths)?.unwrap_or(CvatSettings {
-        base_url: "http://localhost:8080".into(),
-        access_token: String::new(),
-    }))
+    Ok(
+        load_optional_cvat_settings(&paths)?.unwrap_or(CvatSettings {
+            base_url: "http://localhost:8080".into(),
+            access_token: String::new(),
+        }),
+    )
 }
 
 pub fn save_cvat_settings_by_id(
@@ -802,8 +1469,15 @@ pub fn test_cvat_settings_by_id(workspace_id: &str) -> Result<(), String> {
 pub fn open_cvat(input: OpenCvatInput) -> Result<(), String> {
     let paths = resolve_workspace_paths_by_id(&input.workspace_id)?;
     let target_url = if let Some(task_id) = input.task_id.as_deref() {
-        let (task_workspace_id, _task_name, _temp_folder, _last_sync_at, _status, remote_task_id, remote_url) =
-            db::read_cvat_task_metadata(&paths.db_path, task_id)?;
+        let (
+            task_workspace_id,
+            _task_name,
+            _temp_folder,
+            _last_sync_at,
+            _status,
+            remote_task_id,
+            remote_url,
+        ) = db::read_cvat_task_metadata(&paths.db_path, task_id)?;
         if task_workspace_id != input.workspace_id {
             return Err("CVAT task does not belong to this workspace".into());
         }
@@ -837,8 +1511,15 @@ pub fn open_cvat(input: OpenCvatInput) -> Result<(), String> {
 
 pub fn sync_cvat_task(input: SyncCvatTaskInput) -> Result<Vec<CvatTask>, String> {
     let paths = resolve_workspace_paths_by_id(&input.workspace_id)?;
-    let (task_workspace_id, task_name, temp_folder, _last_sync_at, _status, _remote_task_id, _remote_url) =
-        db::read_cvat_task_metadata(&paths.db_path, &input.task_id)?;
+    let (
+        task_workspace_id,
+        task_name,
+        temp_folder,
+        _last_sync_at,
+        _status,
+        _remote_task_id,
+        _remote_url,
+    ) = db::read_cvat_task_metadata(&paths.db_path, &input.task_id)?;
 
     if task_workspace_id != input.workspace_id {
         return Err("CVAT task does not belong to this workspace".into());
@@ -874,7 +1555,12 @@ pub fn sync_cvat_task(input: SyncCvatTaskInput) -> Result<Vec<CvatTask>, String>
 
     let manifest_image_ids = manifest_images
         .iter()
-        .filter_map(|image| image.get("imageId").and_then(|value| value.as_str()).map(str::to_string))
+        .filter_map(|image| {
+            image
+                .get("imageId")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
         .collect::<Vec<_>>();
     let fallback_source_lookup = db::read_images_for_ids(&paths.db_path, &manifest_image_ids)?
         .into_iter()
@@ -900,9 +1586,18 @@ pub fn sync_cvat_task(input: SyncCvatTaskInput) -> Result<Vec<CvatTask>, String>
             .or_else(|| fallback_source_lookup.get(image_id).cloned())
             .ok_or_else(|| format!("failed to resolve source id for staged image {image_id}"))?;
         let staged_file_name = staged_file_name.to_string();
-        staged_image_lookup.insert(staged_file_name.clone(), (image_id.to_string(), source_id.clone()));
-        if let Some(file_name_only) = Path::new(&staged_file_name).file_name().and_then(|value| value.to_str()) {
-            staged_image_lookup.insert(file_name_only.to_string(), (image_id.to_string(), source_id));
+        staged_image_lookup.insert(
+            staged_file_name.clone(),
+            (image_id.to_string(), source_id.clone()),
+        );
+        if let Some(file_name_only) = Path::new(&staged_file_name)
+            .file_name()
+            .and_then(|value| value.to_str())
+        {
+            staged_image_lookup.insert(
+                file_name_only.to_string(),
+                (image_id.to_string(), source_id),
+            );
         }
     }
 
@@ -1108,7 +1803,9 @@ fn write_cvat_settings(
 fn cvat_tasks_url(base_url: &str) -> String {
     format!("{}/tasks", base_url.trim().trim_end_matches('/'))
 }
-fn resolve_workspace_paths_by_id(workspace_id: &str) -> Result<crate::paths::WorkspacePaths, String> {
+fn resolve_workspace_paths_by_id(
+    workspace_id: &str,
+) -> Result<crate::paths::WorkspacePaths, String> {
     let recent = list_recent_workspaces()?;
     let item = recent
         .into_iter()
@@ -1150,7 +1847,14 @@ fn register_scan_progress(
     processed: u32,
     total: u32,
 ) {
-    update_scan_progress(workspace_id, source_id, source_name, stage, processed, total);
+    update_scan_progress(
+        workspace_id,
+        source_id,
+        source_name,
+        stage,
+        processed,
+        total,
+    );
 }
 
 fn update_scan_progress(
@@ -1207,8 +1911,7 @@ fn resolve_source_status(default_status: &str, image_records: &[StoredImageRecor
 }
 
 fn probe_image_dimensions_for_path(path: &Path) -> Result<(u32, u32), String> {
-    let bytes = fs::read(path)
-        .map_err(|error| format!("failed to read image file: {error}"))?;
+    let bytes = fs::read(path).map_err(|error| format!("failed to read image file: {error}"))?;
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
@@ -1274,7 +1977,21 @@ fn parse_jpeg_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
             return Err("truncated JPEG segment payload".into());
         }
 
-        if matches!(marker, 0xC0 | 0xC1 | 0xC2 | 0xC3 | 0xC5 | 0xC6 | 0xC7 | 0xC9 | 0xCA | 0xCB | 0xCD | 0xCE | 0xCF) {
+        if matches!(
+            marker,
+            0xC0 | 0xC1
+                | 0xC2
+                | 0xC3
+                | 0xC5
+                | 0xC6
+                | 0xC7
+                | 0xC9
+                | 0xCA
+                | 0xCB
+                | 0xCD
+                | 0xCE
+                | 0xCF
+        ) {
             if index + 5 > segment_end {
                 return Err("truncated JPEG frame header".into());
             }
@@ -1387,7 +2104,11 @@ fn parse_tiff_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
     }
 }
 
-fn read_tiff_entry_value(bytes: &[u8], entry_offset: usize, little_endian: bool) -> Result<u32, String> {
+fn read_tiff_entry_value(
+    bytes: &[u8],
+    entry_offset: usize,
+    little_endian: bool,
+) -> Result<u32, String> {
     let field_type = read_u16_tiff(bytes, entry_offset + 2, little_endian)?;
     let count = read_u32_tiff(bytes, entry_offset + 4, little_endian)?;
     if count == 0 {
@@ -1497,10 +2218,11 @@ fn build_image_record(
     created_at: &str,
     updated_at: &str,
 ) -> StoredImageRecord {
-    let (width, height, health_status, health_error) = match probe_image_dimensions_for_path(image_path) {
-        Ok((width, height)) => (Some(width), Some(height), "healthy".to_string(), None),
-        Err(error) => (None, None, "corrupted".to_string(), Some(error)),
-    };
+    let (width, height, health_status, health_error) =
+        match probe_image_dimensions_for_path(image_path) {
+            Ok((width, height)) => (Some(width), Some(height), "healthy".to_string(), None),
+            Err(error) => (None, None, "corrupted".to_string(), Some(error)),
+        };
 
     StoredImageRecord {
         id: build_image_id(source_id, image_path),
@@ -1525,7 +2247,14 @@ fn scan_source_folder(source_root: &Path, workspace_id: &str, source_id: &str) -
         .and_then(|value| value.to_str())
         .unwrap_or("source")
         .to_string();
-    register_scan_progress(workspace_id, source_id, &source_name, "Inspecting source folder", 0, 0);
+    register_scan_progress(
+        workspace_id,
+        source_id,
+        &source_name,
+        "Inspecting source folder",
+        0,
+        0,
+    );
     let _guard = ScanProgressGuard {
         workspace_id: workspace_id.to_string(),
         source_id: source_id.to_string(),
@@ -1623,7 +2352,8 @@ fn scan_yolo_source(source_root: &Path, workspace_id: &str, source_id: &str) -> 
         );
 
         if image_record.health_status == "healthy" {
-            let label_path = resolve_yolo_label_path(source_root, &images_root, &labels_root, &image_path);
+            let label_path =
+                resolve_yolo_label_path(source_root, &images_root, &labels_root, &image_path);
             let parsed_annotations = parse_yolo_annotations(
                 &label_path,
                 workspace_id,
@@ -1844,7 +2574,9 @@ fn scan_coco_source(source_root: &Path, workspace_id: &str, source_id: &str) -> 
             continue;
         };
 
-        *annotation_count_by_image.entry(image_id.clone()).or_insert(0) += 1;
+        *annotation_count_by_image
+            .entry(image_id.clone())
+            .or_insert(0) += 1;
         annotation_records.push(StoredAnnotationRecord {
             id: format!("ann-{source_id}-{line_index}"),
             workspace_id: workspace_id.to_string(),
@@ -1908,7 +2640,11 @@ fn detect_source_type(source_root: &Path) -> String {
     "RAW".into()
 }
 
-fn collect_raw_image_records(root: &Path, workspace_id: &str, source_id: &str) -> Vec<StoredImageRecord> {
+fn collect_raw_image_records(
+    root: &Path,
+    workspace_id: &str,
+    source_id: &str,
+) -> Vec<StoredImageRecord> {
     let now = Utc::now().to_rfc3339();
     let source_name = root
         .file_name()
@@ -1995,7 +2731,11 @@ fn collect_image_paths_recursive_filtered(root: &Path, ignored_dir_names: &[&str
                 let skip = entry_path
                     .file_name()
                     .and_then(|value| value.to_str())
-                    .map(|name| ignored_dir_names.iter().any(|ignored| name.eq_ignore_ascii_case(ignored)))
+                    .map(|name| {
+                        ignored_dir_names
+                            .iter()
+                            .any(|ignored| name.eq_ignore_ascii_case(ignored))
+                    })
                     .unwrap_or(false);
                 if !skip {
                     stack.push(entry_path);
@@ -2060,7 +2800,8 @@ fn parse_yolo_names_from_yaml(content: &str) -> Vec<String> {
                     continue;
                 }
                 let raw = next_line.trim();
-                let starts_new_top_level = !next_line.starts_with(' ') && !next_line.starts_with('\t');
+                let starts_new_top_level =
+                    !next_line.starts_with(' ') && !next_line.starts_with('\t');
                 if starts_new_top_level {
                     break;
                 }
@@ -2089,10 +2830,7 @@ fn parse_yolo_names_from_yaml(content: &str) -> Vec<String> {
 }
 
 fn parse_inline_yaml_list(value: &str) -> Vec<String> {
-    let inner = value
-        .trim()
-        .trim_start_matches('[')
-        .trim_end_matches(']');
+    let inner = value.trim().trim_start_matches('[').trim_end_matches(']');
 
     inner
         .split(',')
@@ -2288,9 +3026,18 @@ fn find_coco_annotation_file(root: &Path) -> Option<PathBuf> {
         let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
             continue;
         };
-        let has_images = json.get("images").and_then(|value| value.as_array()).is_some();
-        let has_annotations = json.get("annotations").and_then(|value| value.as_array()).is_some();
-        let has_categories = json.get("categories").and_then(|value| value.as_array()).is_some();
+        let has_images = json
+            .get("images")
+            .and_then(|value| value.as_array())
+            .is_some();
+        let has_annotations = json
+            .get("annotations")
+            .and_then(|value| value.as_array())
+            .is_some();
+        let has_categories = json
+            .get("categories")
+            .and_then(|value| value.as_array())
+            .is_some();
         if has_images && has_annotations && has_categories {
             return Some(candidate);
         }
@@ -2320,7 +3067,13 @@ fn resolve_coco_image_path(source_root: &Path, annotation_file: &Path, file_name
         }
     }
 
-    if let Some(found) = find_file_by_name(source_root, Path::new(file_name).file_name().and_then(|v| v.to_str()).unwrap_or(file_name)) {
+    if let Some(found) = find_file_by_name(
+        source_root,
+        Path::new(file_name)
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or(file_name),
+    ) {
         return found;
     }
 
@@ -2385,7 +3138,11 @@ fn count_coco_categories(root: &Path) -> u32 {
 fn is_supported_image(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| IMAGE_EXTENSIONS.iter().any(|candidate| ext.eq_ignore_ascii_case(candidate)))
+        .map(|ext| {
+            IMAGE_EXTENSIONS
+                .iter()
+                .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+        })
         .unwrap_or(false)
 }
 
@@ -2394,7 +3151,11 @@ fn build_source_id(source_root: &Path) -> String {
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("source");
-    format!("source-{}-{}", slugify_workspace_name(base), Utc::now().timestamp_millis())
+    format!(
+        "source-{}-{}",
+        slugify_workspace_name(base),
+        Utc::now().timestamp_millis()
+    )
 }
 
 fn build_image_id(source_id: &str, image_path: &Path) -> String {
@@ -2414,8 +3175,14 @@ fn make_unique_file_name(file_name: &str, used_names: &mut HashMap<String, usize
     }
 
     let path = Path::new(file_name);
-    let stem = path.file_stem().and_then(|value| value.to_str()).unwrap_or("image");
-    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("image");
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
     let candidate = if ext.is_empty() {
         format!("{stem}-{}", *next)
     } else {
@@ -2434,7 +3201,12 @@ fn sort_images_for_seed(images: &mut [ExportImageRecord], random_seed: u64) {
     });
 }
 
-fn compute_split_counts(total: u32, train_ratio: u32, valid_ratio: u32, test_ratio: u32) -> crate::models::SplitCounts {
+fn compute_split_counts(
+    total: u32,
+    train_ratio: u32,
+    valid_ratio: u32,
+    test_ratio: u32,
+) -> crate::models::SplitCounts {
     let ratio_sum = train_ratio + valid_ratio + test_ratio;
     if total == 0 || ratio_sum == 0 {
         return crate::models::SplitCounts {
@@ -2466,8 +3238,9 @@ fn export_coco_split(
     for (index, image) in images.iter().enumerate() {
         let safe_file_name = ensure_unique_for_export(&image.file_name, &mut used_file_names);
         let destination = split_dir.join(&safe_file_name);
-        fs::copy(&image.original_path, &destination)
-            .map_err(|error| format!("failed to copy image into export split '{split_name}': {error}"))?;
+        fs::copy(&image.original_path, &destination).map_err(|error| {
+            format!("failed to copy image into export split '{split_name}': {error}")
+        })?;
 
         let (width, height) = resolve_export_dimensions(image)?;
         let image_numeric_id = (index as u32) + 1;
@@ -2479,14 +3252,18 @@ fn export_coco_split(
         }));
 
         for annotation in &image.annotations {
-            let next_category_id = if let Some(existing) = category_ids.get(&annotation.category_key) {
-                *existing
-            } else {
-                let next = (category_ids.len() as u32) + 1;
-                category_ids.insert(annotation.category_key.clone(), next);
-                category_names.insert(annotation.category_key.clone(), annotation.category_name.clone());
-                next
-            };
+            let next_category_id =
+                if let Some(existing) = category_ids.get(&annotation.category_key) {
+                    *existing
+                } else {
+                    let next = (category_ids.len() as u32) + 1;
+                    category_ids.insert(annotation.category_key.clone(), next);
+                    category_names.insert(
+                        annotation.category_key.clone(),
+                        annotation.category_name.clone(),
+                    );
+                    next
+                };
 
             let bbox = if annotation.annotation_format.eq_ignore_ascii_case("yolo") {
                 vec![
@@ -2573,9 +3350,20 @@ fn export_yolo_dataset(
     }
 
     let mut export_boxes = 0_u32;
-    export_boxes += export_yolo_split(train_images, &train_images_dir, &train_labels_dir, &categories)?;
-    export_boxes += export_yolo_split(valid_images, &valid_images_dir, &valid_labels_dir, &categories)?;
-    export_boxes += export_yolo_split(test_images, &test_images_dir, &test_labels_dir, &categories)?;
+    export_boxes += export_yolo_split(
+        train_images,
+        &train_images_dir,
+        &train_labels_dir,
+        &categories,
+    )?;
+    export_boxes += export_yolo_split(
+        valid_images,
+        &valid_images_dir,
+        &valid_labels_dir,
+        &categories,
+    )?;
+    export_boxes +=
+        export_yolo_split(test_images, &test_images_dir, &test_labels_dir, &categories)?;
 
     let mut yaml = String::new();
     yaml.push_str("train: train/images\n");
@@ -2677,12 +3465,18 @@ fn filter_export_images(
             if has_image_scope && !selected_image_id_set.contains(image.id.as_str()) {
                 return None;
             }
-            if !selected_source_ids.is_empty() && !selected_source_ids.iter().any(|id| id == &browser_image.source_id) {
+            if !selected_source_ids.is_empty()
+                && !selected_source_ids
+                    .iter()
+                    .any(|id| id == &browser_image.source_id)
+            {
                 return None;
             }
             if !selected_category_ids.is_empty() {
                 image.annotations.retain(|annotation| {
-                    selected_category_ids.iter().any(|id| id == &annotation.category_key)
+                    selected_category_ids
+                        .iter()
+                        .any(|id| id == &annotation.category_key)
                 });
             }
             if image.annotations.is_empty() {
@@ -2755,7 +3549,8 @@ fn count_scoped_browser_images(
                 return selected_image_id_set.contains(image.id.as_str());
             }
 
-            selected_source_ids.is_empty() || selected_source_ids.iter().any(|id| id == &image.source_id)
+            selected_source_ids.is_empty()
+                || selected_source_ids.iter().any(|id| id == &image.source_id)
         })
         .count() as u32
 }
@@ -2772,11 +3567,16 @@ fn collect_export_conflicts(
     let mut grouped = BTreeMap::<String, Vec<crate::models::ExportConflictItem>>::new();
 
     for image in images {
-        grouped.entry(image.file_name.clone()).or_default().push(crate::models::ExportConflictItem {
-            image_id: image.id.clone(),
-            source_id: source_lookup.get(image.id.as_str()).cloned().unwrap_or_default(),
-            original_path: image.original_path.clone(),
-        });
+        grouped.entry(image.file_name.clone()).or_default().push(
+            crate::models::ExportConflictItem {
+                image_id: image.id.clone(),
+                source_id: source_lookup
+                    .get(image.id.as_str())
+                    .cloned()
+                    .unwrap_or_default(),
+                original_path: image.original_path.clone(),
+            },
+        );
     }
 
     grouped
@@ -2794,7 +3594,10 @@ fn build_export_preview(
     dataset_map_exclusions: &DatasetMapExportExclusions,
 ) -> crate::models::ExportPreview {
     let included_images = images.len() as u32;
-    let included_boxes = images.iter().map(|image| image.annotations.len() as u32).sum();
+    let included_boxes = images
+        .iter()
+        .map(|image| image.annotations.len() as u32)
+        .sum();
     let (dataset_map_excluded_images, dataset_map_excluded_boxes) =
         count_dataset_map_export_exclusions(&images, dataset_map_exclusions);
     let filename_conflicts = collect_export_conflicts(&images, browser_payload);
@@ -2803,7 +3606,12 @@ fn build_export_preview(
     let test = included_images.saturating_sub(train).saturating_sub(valid);
     let category_count = images
         .iter()
-        .flat_map(|image| image.annotations.iter().map(|annotation| annotation.category_key.as_str()))
+        .flat_map(|image| {
+            image
+                .annotations
+                .iter()
+                .map(|annotation| annotation.category_key.as_str())
+        })
         .collect::<HashSet<_>>()
         .len() as u32;
 
@@ -2848,8 +3656,14 @@ fn ensure_unique_for_export(file_name: &str, used_names: &mut HashSet<String>) -
     }
 
     let path = Path::new(file_name);
-    let stem = path.file_stem().and_then(|value| value.to_str()).unwrap_or("image");
-    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("image");
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
 
     let mut index = 1_u32;
     loop {
@@ -2893,7 +3707,9 @@ fn validate_workspace_name(name: &str) -> Result<(), String> {
     if trimmed.is_empty() {
         return Err("workspace name is required".into());
     }
-    if trimmed.chars().any(|ch| matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || ch.is_control()) {
+    if trimmed.chars().any(|ch| {
+        matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || ch.is_control()
+    }) {
         return Err("workspace name contains characters that are not allowed on Windows".into());
     }
     if trimmed.ends_with(' ') || trimmed.ends_with('.') {
@@ -2902,8 +3718,8 @@ fn validate_workspace_name(name: &str) -> Result<(), String> {
 
     let upper = trimmed.to_ascii_uppercase();
     let reserved = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
     if reserved.iter().any(|item| *item == upper) {
         return Err("workspace name uses a reserved Windows device name".into());
@@ -2912,7 +3728,10 @@ fn validate_workspace_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn inspect_workspace_creation_target(root: &Path, hidden_dir: &Path) -> Result<&'static str, String> {
+fn inspect_workspace_creation_target(
+    root: &Path,
+    hidden_dir: &Path,
+) -> Result<&'static str, String> {
     if hidden_dir.exists() {
         return Ok("existing-workspace");
     }
@@ -2932,7 +3751,11 @@ fn inspect_workspace_creation_target(root: &Path, hidden_dir: &Path) -> Result<&
     Ok("available")
 }
 
-fn validate_workspace_creation_target(root: &Path, hidden_dir: &Path, allow_existing_target: bool) -> Result<(), String> {
+fn validate_workspace_creation_target(
+    root: &Path,
+    hidden_dir: &Path,
+    allow_existing_target: bool,
+) -> Result<(), String> {
     match inspect_workspace_creation_target(root, hidden_dir)? {
         "available" => Ok(()),
         "existing-empty" if allow_existing_target => Ok(()),
@@ -2962,7 +3785,11 @@ fn create_workspace_directories(paths: &crate::paths::WorkspacePaths) -> Result<
     Ok(())
 }
 
-fn ensure_workspace_exists(root: &Path, manifest_path: &Path, db_path: &Path) -> Result<(), String> {
+fn ensure_workspace_exists(
+    root: &Path,
+    manifest_path: &Path,
+    db_path: &Path,
+) -> Result<(), String> {
     if !root.exists() {
         return Err("workspace folder does not exist".into());
     }
@@ -3044,7 +3871,6 @@ fn write_recent_workspaces_file(path: &Path, items: &[RecentWorkspace]) -> Resul
 fn normalize_path_string(path: &Path) -> String {
     path.to_string_lossy().replace('/', "\\")
 }
-
 
 fn parse_json_number(value: &serde_json::Value) -> Option<f64> {
     if let Some(number) = value.as_f64() {
@@ -3240,47 +4066,147 @@ mod tests {
     fn parse_json_number_accepts_numeric_strings() {
         assert_eq!(parse_json_number(&serde_json::json!(444.0)), Some(444.0));
         assert_eq!(parse_json_number(&serde_json::json!("444.00")), Some(444.0));
-        assert_eq!(parse_json_number(&serde_json::json!(" 508.00 ")), Some(508.0));
+        assert_eq!(
+            parse_json_number(&serde_json::json!(" 508.00 ")),
+            Some(508.0)
+        );
         assert_eq!(parse_json_number(&serde_json::json!("abc")), None);
     }
 
     #[test]
-    fn start_embedding_job_stores_object_embedding_rows() {
+    fn start_embedding_job_requires_real_model_asset() {
         let (parent, overview) = seed_embedding_workspace("object-job");
+
+        let result = start_embedding_job_by_id(EmbeddingJobInput {
+            workspace_id: overview.id.clone(),
+            scope: "object".to_string(),
+            model_id: "clip-vit-b32".to_string(),
+            runtime_preference: "auto".to_string(),
+        });
+        let error = match result {
+            Ok(_) => "unexpected success".to_string(),
+            Err(error) => error,
+        };
+
+        let paths = build_workspace_paths(&PathBuf::from(&overview.workspace_path));
+        let connection = Connection::open(&paths.db_path).unwrap();
+        let embedding_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(1) FROM embeddings WHERE workspace_id = ?1 AND scope = 'object' AND model_id = 'clip-vit-b32'",
+                params![overview.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(error.contains("model asset not found"));
+        assert_eq!(embedding_count, 0);
+
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn dataset_map_defaults_to_fast_preview_encoder() {
+        let (parent, overview) = seed_embedding_workspace("preview-default");
+
+        let payload = load_dataset_map_payload_by_id(DatasetMapPayloadInput {
+            workspace_id: overview.id.clone(),
+            scope: "object".to_string(),
+            model_id: None,
+        })
+        .unwrap();
+
+        assert_eq!(payload.model_id, "fast-preview");
+        assert_eq!(payload.models[0].id, "fast-preview");
+        assert_eq!(payload.models[0].display_name, "Fast Preview (No Model)");
+        assert_eq!(payload.points.len(), 1);
+
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn start_embedding_job_generates_fast_preview_without_model_asset() {
+        let (parent, overview) = seed_embedding_workspace("preview-job");
 
         let job = start_embedding_job_by_id(EmbeddingJobInput {
             workspace_id: overview.id.clone(),
             scope: "object".to_string(),
-            model_id: "clip-vit-b32".to_string(),
+            model_id: "fast-preview".to_string(),
             runtime_preference: "auto".to_string(),
         })
         .unwrap();
 
         let paths = build_workspace_paths(&PathBuf::from(&overview.workspace_path));
         let connection = Connection::open(&paths.db_path).unwrap();
-        let (target_id, blob_len): (String, usize) = connection
+        let projection_count: i64 = connection
             .query_row(
-                "SELECT target_id, length(vector) FROM embeddings WHERE workspace_id = ?1 AND scope = 'object' AND model_id = 'clip-vit-b32'",
+                "SELECT COUNT(1) FROM embedding_projections WHERE workspace_id = ?1 AND scope = 'object' AND model_id = 'fast-preview' AND projection_method = 'bootstrap-deterministic'",
                 params![overview.id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
             .unwrap();
-        let pca_projection_count: i64 = connection
+        let embedding_count: i64 = connection
             .query_row(
-                "SELECT COUNT(1) FROM embedding_projections WHERE workspace_id = ?1 AND scope = 'object' AND model_id = 'clip-vit-b32' AND projection_method = 'pca-v1'",
+                "SELECT COUNT(1) FROM embeddings WHERE workspace_id = ?1 AND scope = 'object' AND model_id = 'fast-preview'",
                 params![overview.id],
                 |row| row.get(0),
             )
             .unwrap();
 
         assert_eq!(job.status, "completed");
+        assert_eq!(job.runtime_backend, None);
         assert_eq!(job.processed_items, 1);
-        assert_eq!(job.total_items, 1);
-        assert_eq!(target_id, "ann-1");
-        assert!(blob_len > 0);
-        assert_eq!(pca_projection_count, 1);
+        assert_eq!(projection_count, 1);
+        assert_eq!(embedding_count, 0);
 
         let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn embedding_job_progress_replaces_same_workspace_scope_model() {
+        let workspace_id = format!(
+            "ws-progress-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        update_embedding_progress(
+            &workspace_id,
+            "object",
+            "clip-vit-b32",
+            "running",
+            "Running inference",
+            1,
+            10,
+            Some("cpu".to_string()),
+            "auto",
+        );
+        update_embedding_progress(
+            &workspace_id,
+            "object",
+            "clip-vit-b32",
+            "completed",
+            "Completed",
+            10,
+            10,
+            Some("cpu".to_string()),
+            "auto",
+        );
+        update_embedding_progress(
+            "other-workspace",
+            "object",
+            "clip-vit-b32",
+            "running",
+            "Running inference",
+            1,
+            10,
+            Some("cpu".to_string()),
+            "auto",
+        );
+
+        let jobs = current_embedding_jobs(&workspace_id);
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].workspace_id, workspace_id);
+        assert_eq!(jobs[0].status, "completed");
+        assert_eq!(jobs[0].processed_items, 10);
     }
 
     #[test]
@@ -3375,7 +4301,8 @@ mod tests {
         }];
         let categories = vec![("helmet".to_string(), "helmet".to_string())];
 
-        let exported_boxes = export_yolo_split(&images, &images_dir, &labels_dir, &categories).unwrap();
+        let exported_boxes =
+            export_yolo_split(&images, &images_dir, &labels_dir, &categories).unwrap();
         assert_eq!(exported_boxes, 1);
 
         let label = fs::read_to_string(labels_dir.join("source.txt")).unwrap();
@@ -3383,21 +4310,30 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    #[ignore]
+    fn debug_start_embedding_job_for_recent_workspace() {
+        let workspace_id = std::env::var("DATAVIEWER_DEBUG_WORKSPACE_ID")
+            .expect("set DATAVIEWER_DEBUG_WORKSPACE_ID");
+        let model_id = std::env::var("DATAVIEWER_DEBUG_MODEL_ID")
+            .unwrap_or_else(|_| "clip-vit-b32".to_string());
+        let scope =
+            std::env::var("DATAVIEWER_DEBUG_SCOPE").unwrap_or_else(|_| "object".to_string());
+
+        let result = start_embedding_job_by_id(EmbeddingJobInput {
+            workspace_id,
+            scope,
+            model_id,
+            runtime_preference: "cpu".to_string(),
+        });
+
+        match result {
+            Ok(job) => println!(
+                "debug embedding job completed: {}",
+                job.message.unwrap_or_default()
+            ),
+            Err(error) => panic!("debug embedding job failed: {error}"),
+        }
+    }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

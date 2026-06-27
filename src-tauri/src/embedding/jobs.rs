@@ -1,4 +1,6 @@
+#[cfg(test)]
 use std::collections::hash_map::DefaultHasher;
+#[cfg(test)]
 use std::hash::{Hash, Hasher};
 
 use crate::embedding::runtime::RuntimeBackend;
@@ -48,6 +50,7 @@ pub fn serialize_f32_vector(values: &[f32]) -> Vec<u8> {
         .collect()
 }
 
+#[cfg(test)]
 pub fn deterministic_embedding_for_item(
     item: &EmbeddingJobItem,
     model_id: &str,
@@ -73,6 +76,15 @@ pub fn deterministic_embedding_for_item(
             (normalized.mul_add(2.0, -1.0)) as f32
         })
         .collect()
+}
+
+pub fn l2_normalize_vector(values: Vec<f32>) -> Vec<f32> {
+    let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm <= f32::EPSILON {
+        return values;
+    }
+
+    values.into_iter().map(|value| value / norm).collect()
 }
 
 #[cfg(test)]
@@ -117,5 +129,18 @@ mod tests {
         assert_eq!(first, second);
         assert_ne!(first, changed_model);
         assert!(first.iter().all(|value| (-1.0..=1.0).contains(value)));
+    }
+
+    #[test]
+    fn l2_normalize_vector_scales_non_zero_vectors() {
+        let normalized = l2_normalize_vector(vec![3.0, 4.0]);
+
+        assert!((normalized[0] - 0.6).abs() < 0.0001);
+        assert!((normalized[1] - 0.8).abs() < 0.0001);
+    }
+
+    #[test]
+    fn l2_normalize_vector_preserves_zero_vectors() {
+        assert_eq!(l2_normalize_vector(vec![0.0, 0.0]), vec![0.0, 0.0]);
     }
 }

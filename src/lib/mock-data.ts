@@ -293,8 +293,17 @@ export const sampleImageDetailPayload: ImageDetailPayload = {
 export const sampleDatasetMapPayload: DatasetMapPayload = {
   workspaceId: "factory-defect-v1",
   scope: "object",
-  modelId: "clip-vit-b32",
+  modelId: "fast-preview",
   models: [
+    {
+      id: "fast-preview",
+      family: "preview",
+      displayName: "Fast Preview (No Model)",
+      embeddingDim: 2,
+      inputSize: 0,
+      available: true,
+      downloadRequired: false,
+    },
     {
       id: "clip-vit-b32",
       family: "clip",

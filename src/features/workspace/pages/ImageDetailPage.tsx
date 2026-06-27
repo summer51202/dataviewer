@@ -35,6 +35,7 @@ export function ImageDetailPage() {
   const { workspaceId = "factory-defect-v1", imageId = "" } = useParams();
   const [searchParams] = useSearchParams();
   const returnTarget = searchParams.get("from") === "dataset-map" ? "dataset-map" : "browser";
+  const highlightedAnnotationId = searchParams.get("annotationId");
   const backPath = `/workspace/${workspaceId}/${returnTarget}`;
   const backLabel = returnTarget === "dataset-map" ? "Back to Dataset Map" : "Back to Browser";
   const { data } = useQuery({
@@ -63,10 +64,10 @@ export function ImageDetailPage() {
 
     return data.boxes.map((box, index) => ({
       id: box.id,
-      label: `${index + 1}. ${box.categoryName}`,
+      label: `${index + 1}. ${box.categoryName}${highlightedAnnotationId === box.id ? " (selected)" : ""}`,
       ratioLabel: formatPercent(getBoxAreaRatio(box, imageWidth, imageHeight)),
     }));
-  }, [data, naturalSize]);
+  }, [data, highlightedAnnotationId, naturalSize]);
 
   if (!data) {
     return (
@@ -142,8 +143,14 @@ export function ImageDetailPage() {
                 return null;
               }
 
+              const isHighlighted = highlightedAnnotationId === box.id;
+
               return (
-                <div className="bbox bbox-real" key={box.id} style={style}>
+                <div
+                  className={`bbox bbox-real${isHighlighted ? " bbox-highlighted" : ""}`}
+                  key={box.id}
+                  style={style}
+                >
                   <span className="bbox-label">{box.categoryName}</span>
                 </div>
               );

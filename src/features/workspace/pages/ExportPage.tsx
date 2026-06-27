@@ -4,7 +4,14 @@ import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { Panel } from "../../../components/ui/Panel";
 import { StatCard } from "../../../components/ui/StatCard";
-import { getBrowserPayload, getExportPreview, openExportFolder, startExport } from "../../../lib/api";
+import {
+  getBrowserPayload,
+  getExportPreview,
+  getSampleSetMembers,
+  listSampleSets,
+  openExportFolder,
+  startExport,
+} from "../../../lib/api";
 import { describeError, pickFolder } from "../../../lib/tauri";
 import { useWorkspaceStore } from "../../../state/useWorkspaceStore";
 import { ExportScopeMode, resolveExportScopeImages } from "../browserScope";
@@ -103,16 +110,35 @@ export function ExportPage() {
       selectedSourceIds,
     ],
   );
-  const exportImageIds = useMemo(() => scopedImages.map((image) => image.id), [scopedImages]);
+  const browserImageIds = useMemo(() => scopedImages.map((image) => image.id), [scopedImages]);
+
+  const [sampleSetName, setSampleSetName] = useState("");
+
+  const sampleSetsQuery = useQuery({
+    queryKey: ["sample-sets", workspaceId],
+    queryFn: () => listSampleSets(workspaceId),
+  });
+
+  const sampleMembersQuery = useQuery({
+    queryKey: ["sample-set-members", workspaceId, sampleSetName],
+    queryFn: () => getSampleSetMembers(workspaceId, sampleSetName),
+    enabled: sampleSetName !== "",
+  });
+
+  // When a sample set is chosen it overrides the Browser scope.
+  const exportImageIds = useMemo(
+    () => (sampleSetName ? sampleMembersQuery.data?.imageIds ?? [] : browserImageIds),
+    [sampleSetName, sampleMembersQuery.data, browserImageIds],
+  );
 
   const { data } = useQuery({
-    queryKey: ["export-preview", workspaceId, scopeMode, exportImageIds],
+    queryKey: ["export-preview", workspaceId, scopeMode, sampleSetName, exportImageIds],
     queryFn: () =>
       getExportPreview({
         workspaceId,
         imageIds: exportImageIds,
       }),
-    enabled: !!browserPayload,
+    enabled: !!browserPayload && (sampleSetName === "" || sampleMembersQuery.isSuccess),
   });
 
   const [outputFormat, setOutputFormat] = useState("COCO");
@@ -305,10 +331,20 @@ export function ExportPage() {
         </div>
       ) : null}
 
-      {scopeSummary.totalCount === 0 ? (
+      {scopeSummary.totalCount === 0 && !sampleSetName ? (
         <div className="status-banner status-banner-warning">
           <strong>No images in the current export scope.</strong>
           <span>Go back to Browser to adjust filters or select images first.</span>
+        </div>
+      ) : null}
+
+      {sampleSetName ? (
+        <div className="status-banner status-banner-info">
+          <strong>Sample set scope active: {sampleSetName}</strong>
+          <span>
+            Exporting {exportImageIds.length} images from this sample set. Browser scope is ignored.
+            Counts in Export Summary below are authoritative.
+          </span>
         </div>
       ) : null}
 
@@ -370,6 +406,21 @@ export function ExportPage() {
 
       <Panel title="Export Settings" subtitle="Configure output format, split ratios, conflict handling, and target folder.">
         <div className="export-settings-grid">
+          <label className="field">
+            <span>Sample Set</span>
+            <select value={sampleSetName} onChange={(event) => setSampleSetName(event.target.value)}>
+              <option value="">None (use Browser scope)</option>
+              {(sampleSetsQuery.data ?? []).map((set) => (
+                <option key={set.id} value={set.name}>
+                  {set.name} ({set.selectedImages} images)
+                </option>
+              ))}
+            </select>
+            <span className="field-help">
+              Selecting a sample set exports exactly its images and overrides the Browser scope.
+            </span>
+          </label>
+
           <label className="field">
             <span>Output Format</span>
             <div className="field-inline">
@@ -452,7 +503,7 @@ export function ExportPage() {
             className="button button-primary"
             disabled={
               exportMutation.isPending ||
-              scopeSummary.totalCount === 0 ||
+              (!sampleSetName && scopeSummary.totalCount === 0) ||
               data.includedImages === 0 ||
               (data.filenameConflicts > 0 && !allowAutoRenameConflicts)
             }

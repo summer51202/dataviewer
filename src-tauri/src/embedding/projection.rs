@@ -1,11 +1,33 @@
 pub fn deterministic_projection(seed: &str) -> (f64, f64) {
-    let mut hash = 0_u64;
-    for byte in seed.as_bytes() {
-        hash = hash.wrapping_mul(31).wrapping_add(*byte as u64);
-    }
-    let x = ((hash & 0xffff) as f64 / 65535.0) * 2.0 - 1.0;
-    let y = (((hash >> 16) & 0xffff) as f64 / 65535.0) * 2.0 - 1.0;
+    let hash = stable_hash(seed.as_bytes());
+    // Route BOTH coordinates through splitmix64 (with distinct seeds) so the raw
+    // FNV-1a high bits don't band the x axis into a few columns for sequential ids.
+    let hx = splitmix64(hash ^ 0x2545_f491_4f6c_dd1d);
+    let hy = splitmix64(hash ^ 0x9e37_79b9_7f4a_7c15);
+    let x = unit_from_hash(hx) * 2.0 - 1.0;
+    let y = unit_from_hash(hy) * 2.0 - 1.0;
     (x, y)
+}
+
+fn stable_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn unit_from_hash(value: u64) -> f64 {
+    let mantissa = value >> 11;
+    mantissa as f64 / ((1_u64 << 53) - 1) as f64
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -26,7 +48,11 @@ pub fn pca_projection(inputs: &[ProjectionInput]) -> Vec<ProjectionPoint> {
         return Vec::new();
     }
 
-    let dimensions = inputs.iter().map(|input| input.vector.len()).max().unwrap_or(0);
+    let dimensions = inputs
+        .iter()
+        .map(|input| input.vector.len())
+        .max()
+        .unwrap_or(0);
     if dimensions == 0 {
         return inputs
             .iter()
@@ -170,6 +196,32 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_projection_spreads_similar_ids() {
+        let points = (0..64)
+            .map(|index| deterministic_projection(&format!("object:fast-preview:ann-{index}")))
+            .collect::<Vec<_>>();
+        let unique_cells = points
+            .iter()
+            .map(|(x, y)| ((x * 20.0).round() as i32, (y * 20.0).round() as i32))
+            .collect::<std::collections::HashSet<_>>();
+
+        assert!(unique_cells.len() > 56);
+
+        // Each axis must spread on its own — guards against one axis banding into
+        // a few columns/rows for sequential ids (regression guard).
+        let unique_x = points
+            .iter()
+            .map(|(x, _)| (x * 20.0).round() as i32)
+            .collect::<std::collections::HashSet<_>>();
+        let unique_y = points
+            .iter()
+            .map(|(_, y)| (y * 20.0).round() as i32)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(unique_x.len() > 24, "x axis is banded: {} bins", unique_x.len());
+        assert!(unique_y.len() > 24, "y axis is banded: {} bins", unique_y.len());
+    }
+
+    #[test]
     fn pca_projection_is_stable_bounded_and_keeps_target_ids() {
         let inputs = vec![
             ProjectionInput {
@@ -191,7 +243,10 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(
-            first.iter().map(|point| point.target_id.as_str()).collect::<Vec<_>>(),
+            first
+                .iter()
+                .map(|point| point.target_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["ann-a", "ann-b", "ann-c"]
         );
         assert!(first
