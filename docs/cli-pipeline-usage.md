@@ -19,8 +19,7 @@ sample set
 子資料集
 ```
 
-> 採樣參數的完整細節見 `docs/cli-sample-selection-usage.md`;設計理念見
-> `docs/spec-auto-sample-selection.md`。本文聚焦端到端串接。
+> 採樣參數的完整細節見 `docs/cli-sample-selection-usage.md`。本文聚焦端到端串接。
 
 ---
 

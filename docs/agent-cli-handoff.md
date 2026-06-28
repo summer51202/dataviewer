@@ -95,5 +95,5 @@ real CLIP encoder instead of deterministic mock vectors.
 - Multi-split export merges + renumbers ids and unifies categories by name into
   one valid COCO.
 - Quote paths that contain spaces.
-- Full reference: `docs/cli-pipeline-usage.md`, `docs/cli-sample-selection-usage.md`,
-  `docs/spec-auto-sample-selection.md`.
+- Full reference: `docs/cli-pipeline-usage.md` (end-to-end) and
+  `docs/cli-sample-selection-usage.md` (sampling parameters).

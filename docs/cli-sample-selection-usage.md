@@ -2,7 +2,7 @@
 
 `scripts/run_sample_selection.py` 是一支可獨立執行的命令列工具,從 workspace 已存的 embedding
 產生「覆蓋率最大化、攤平分佈」的樣本子集,並以**具名、非破壞性**的 sample set 寫回 DB,供另外匯出。
-GUI 與 agent 都走同一支 CLI。設計細節見 `docs/spec-auto-sample-selection.md`。
+GUI 與 agent 都走同一支 CLI。
 
 > 這支工具是下游步驟,假設 `embeddings` 表已有資料。若你是從一份 COCO 資料集**從零開始**,
 > 請看 `docs/cli-pipeline-usage.md`(ingest → 產 embedding → 採樣 → 匯出的完整流程)。
