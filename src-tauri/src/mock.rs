@@ -277,6 +277,8 @@ pub fn export_preview() -> ExportPreview {
         included_images: 1984,
         excluded_images: 231,
         included_boxes: 8451,
+        dataset_map_excluded_images: 12,
+        dataset_map_excluded_boxes: 37,
         filename_conflicts: 4,
         conflict_details: vec![crate::models::ExportFilenameConflict {
             file_name: "0001.jpg".into(),

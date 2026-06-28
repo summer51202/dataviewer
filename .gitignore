@@ -22,3 +22,8 @@ tmp/
 
 .idea/
 .vscode/
+
+.worktrees/
+
+# Cowork/agent session build artifacts (cargo-target-elevated, etc.)
+.session/

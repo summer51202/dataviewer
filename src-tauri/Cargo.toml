@@ -1,8 +1,12 @@
 [package]
 name = "dataviewer"
-version = "0.1.3"
+version = "0.2.0"
 description = "Desktop dataset curation shell for COCO, YOLO, and RAW image workflows"
 edition = "2021"
+
+[features]
+default = []
+onnx-runtime = ["dep:ndarray", "dep:ort", "ort/load-dynamic", "ort/api-20", "ort/ndarray"]
 
 [lib]
 name = "dataviewer_lib"
@@ -13,10 +17,12 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 chrono = { version = "0.4", features = ["clock", "serde"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+ndarray = { version = "0.17", optional = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
-
+ort = { version = "2.0.0-rc.12", default-features = false, optional = true }

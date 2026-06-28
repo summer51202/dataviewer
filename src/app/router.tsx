@@ -3,6 +3,7 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { WorkspaceLayout } from "./layout/WorkspaceLayout";
 import { HomePage } from "../features/home/pages/HomePage";
 import { BrowserPage } from "../features/workspace/pages/BrowserPage";
+import { DatasetMapPage } from "../features/workspace/pages/DatasetMapPage";
 import { SourcesPage } from "../features/workspace/pages/SourcesPage";
 import { ImportReviewPage } from "../features/workspace/pages/ImportReviewPage";
 import { CvatTasksPage } from "../features/workspace/pages/CvatTasksPage";
@@ -18,6 +19,7 @@ export function AppRouter() {
         <Route path="/workspace/:workspaceId" element={<WorkspaceLayout />}>
           <Route index element={<Navigate replace to="browser" />} />
           <Route path="browser" element={<BrowserPage />} />
+          <Route path="dataset-map" element={<DatasetMapPage />} />
           <Route path="sources" element={<SourcesPage />} />
           <Route path="import-review" element={<ImportReviewPage />} />
           <Route path="cvat" element={<CvatTasksPage />} />

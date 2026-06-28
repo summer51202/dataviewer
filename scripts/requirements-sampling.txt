@@ -1,0 +1,8 @@
+# Python dependencies for scripts/run_sample_selection.py
+# Install with: pip install -r scripts/requirements-sampling.txt
+#
+# Note: sampling does NOT require umap-learn. Coverage selection
+# (facility-location / farthest-point) and outlier detection are
+# implemented on top of numpy + scikit-learn only.
+numpy>=1.23
+scikit-learn>=1.1

@@ -257,6 +257,8 @@ pub struct ExportPreview {
     pub included_images: u32,
     pub excluded_images: u32,
     pub included_boxes: u32,
+    pub dataset_map_excluded_images: u32,
+    pub dataset_map_excluded_boxes: u32,
     pub filename_conflicts: u32,
     pub conflict_details: Vec<ExportFilenameConflict>,
     pub split_counts: SplitCounts,
@@ -265,6 +267,7 @@ pub struct ExportPreview {
 
 #[derive(Clone)]
 pub struct ExportAnnotationRecord {
+    pub id: String,
     pub category_key: String,
     pub category_name: String,
     pub annotation_format: String,
@@ -393,6 +396,7 @@ pub struct StartExportInput {
     pub random_seed: u64,
     pub output_path: String,
     pub allow_auto_rename_conflicts: bool,
+    pub exclude_dataset_map_items: bool,
     pub image_ids: Option<Vec<String>>,
     pub source_ids: Option<Vec<String>>,
     pub category_ids: Option<Vec<String>>,
@@ -405,4 +409,206 @@ pub struct StartExportResult {
     pub output_path: String,
     pub exported_images: u32,
     pub exported_boxes: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingModelOption {
+    pub id: String,
+    pub family: String,
+    pub display_name: String,
+    pub embedding_dim: u32,
+    pub input_size: u32,
+    pub available: bool,
+    pub download_required: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingRuntimeCapability {
+    pub backend: String,
+    pub available: bool,
+    pub label: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingRuntimeProbe {
+    pub preference: String,
+    pub selected_backend: String,
+    pub capabilities: Vec<EmbeddingRuntimeCapability>,
+    pub fallback_reason: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetMapBbox {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub area_ratio: Option<f64>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetMapPoint {
+    pub id: String,
+    pub scope: String,
+    pub image_id: String,
+    pub annotation_id: Option<String>,
+    pub filename: String,
+    pub source_id: String,
+    pub source_name: String,
+    pub category_id: Option<String>,
+    pub category_name: Option<String>,
+    pub bbox: Option<DatasetMapBbox>,
+    pub x: f64,
+    pub y: f64,
+    pub review_status: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingJob {
+    pub id: String,
+    pub workspace_id: String,
+    pub scope: String,
+    pub model_id: String,
+    pub runtime_preference: String,
+    pub runtime_backend: Option<String>,
+    pub status: String,
+    pub processed_items: u32,
+    pub total_items: u32,
+    pub message: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetMapPayload {
+    pub workspace_id: String,
+    pub scope: String,
+    pub model_id: String,
+    pub models: Vec<EmbeddingModelOption>,
+    pub runtime: EmbeddingRuntimeProbe,
+    pub points: Vec<DatasetMapPoint>,
+    pub jobs: Vec<EmbeddingJob>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetMapPayloadInput {
+    pub workspace_id: String,
+    pub scope: String,
+    pub model_id: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingRuntimeProbeInput {
+    pub workspace_id: String,
+    pub preference: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingJobInput {
+    pub workspace_id: String,
+    pub scope: String,
+    pub model_id: String,
+    pub runtime_preference: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetReviewUpdate {
+    pub target_id: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetMapReviewInput {
+    pub workspace_id: String,
+    pub scope: String,
+    pub updates: Vec<DatasetReviewUpdate>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SampleSelectionInput {
+    pub workspace_id: String,
+    pub scope: String,
+    pub model_id: String,
+    pub name: String,
+    pub target_images: Option<u32>,
+    pub target_ratio: Option<f64>,
+    pub mode: String,
+    pub remove_outliers: bool,
+    pub outlier_method: Option<String>,
+    pub outlier_pct: Option<f64>,
+    pub per_class_floor: Option<u32>,
+    pub pca_dim: Option<u32>,
+    pub seed: Option<u32>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SampleSelectionSummary {
+    pub sample_set: String,
+    pub mode: String,
+    pub selected_images: u32,
+    pub selected_objects: u32,
+    pub excluded_outliers: u32,
+    pub saturated: bool,
+    pub seed: u32,
+    pub total_images: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SampleSet {
+    pub id: String,
+    pub name: String,
+    pub scope: String,
+    pub model_id: String,
+    pub mode: String,
+    pub target_images: Option<u32>,
+    pub target_ratio: Option<f64>,
+    pub selected_images: u32,
+    pub selected_objects: u32,
+    pub excluded_outliers: u32,
+    pub saturated: bool,
+    pub created_at: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SampleSetListInput {
+    pub workspace_id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteSampleSetInput {
+    pub workspace_id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SampleSetMembersInput {
+    pub workspace_id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SampleSetMembers {
+    pub image_ids: Vec<String>,
+    pub object_ids: Vec<String>,
 }

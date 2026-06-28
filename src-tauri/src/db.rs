@@ -1,15 +1,44 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use rusqlite::{params, Connection};
 
 use crate::models::{
-    BoundingBoxRecord, BoxSummary, BrowserPayload, ExportHistoryEntry, ImageCard, ImageDetailPayload,
-    ImportReviewRow, ExportAnnotationRecord, ExportConflictItem, ExportFilenameConflict,
-    ExportImageRecord, SourceFolder, StoredAnnotationRecord, StoredCategoryRecord,
-    StoredImageRecord, StoredSourceFolder, UnifiedCategory, WorkspaceOverview, AnnotationVersion,
+    AnnotationVersion, BoundingBoxRecord, BoxSummary, BrowserPayload, DatasetMapBbox,
+    DatasetMapPoint, DatasetReviewUpdate, ExportAnnotationRecord, ExportConflictItem,
+    ExportFilenameConflict, ExportHistoryEntry, ExportImageRecord, ImageCard,
+    ImageDetailPayload, ImportReviewRow, SampleSet, SampleSetMembers, SourceFolder,
+    StoredAnnotationRecord, StoredCategoryRecord, StoredImageRecord, StoredSourceFolder,
+    UnifiedCategory, WorkspaceOverview,
 };
 use crate::paths::APP_VERSION;
+use crate::embedding::jobs::{CropRect, EmbeddingJobItem, EmbeddingRecord, serialize_f32_vector};
+
+pub struct DatasetMapProjectionTarget {
+    pub target_id: String,
+}
+
+pub struct EmbeddingProjectionRow {
+    pub id: String,
+    pub workspace_id: String,
+    pub scope: String,
+    pub target_id: String,
+    pub model_id: String,
+    pub projection_method: String,
+    pub x: f64,
+    pub y: f64,
+    pub created_at: String,
+}
+
+pub struct EmbeddingVectorRow {
+    pub target_id: String,
+    pub vector: Vec<f32>,
+}
+
+pub struct DatasetMapExportExclusions {
+    pub image_ids: HashSet<String>,
+    pub annotation_ids: HashSet<String>,
+}
 
 const INIT_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS workspace_meta (
@@ -135,6 +164,79 @@ CREATE TABLE IF NOT EXISTS cvat_tasks (
     FOREIGN KEY(workspace_id) REFERENCES workspace_meta(id)
 );
 
+CREATE TABLE IF NOT EXISTS embedding_models (
+    id TEXT PRIMARY KEY,
+    family TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    embedding_dim INTEGER NOT NULL,
+    input_size INTEGER NOT NULL,
+    preprocess_version TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS embedding_jobs (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    runtime_preference TEXT NOT NULL,
+    runtime_backend TEXT,
+    status TEXT NOT NULL,
+    processed_items INTEGER NOT NULL DEFAULT 0,
+    total_items INTEGER NOT NULL DEFAULT 0,
+    message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(workspace_id) REFERENCES workspace_meta(id)
+);
+
+CREATE TABLE IF NOT EXISTS embeddings (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    image_id TEXT NOT NULL,
+    annotation_id TEXT,
+    model_id TEXT NOT NULL,
+    runtime_backend TEXT NOT NULL,
+    vector BLOB NOT NULL,
+    vector_norm REAL,
+    created_at TEXT NOT NULL,
+    UNIQUE(workspace_id, scope, target_id, model_id),
+    FOREIGN KEY(workspace_id) REFERENCES workspace_meta(id),
+    FOREIGN KEY(image_id) REFERENCES images(id),
+    FOREIGN KEY(annotation_id) REFERENCES annotations(id)
+);
+
+CREATE TABLE IF NOT EXISTS embedding_projections (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    projection_method TEXT NOT NULL,
+    x REAL NOT NULL,
+    y REAL NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(workspace_id, scope, target_id, model_id, projection_method),
+    FOREIGN KEY(workspace_id) REFERENCES workspace_meta(id)
+);
+
+CREATE TABLE IF NOT EXISTS dataset_review_marks (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(workspace_id, scope, target_id),
+    FOREIGN KEY(workspace_id) REFERENCES workspace_meta(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_source_folders_workspace_id ON source_folders(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_images_source_id ON images(source_id);
 CREATE INDEX IF NOT EXISTS idx_images_workspace_id ON images(workspace_id);
@@ -147,6 +249,41 @@ CREATE INDEX IF NOT EXISTS idx_annotations_image_id ON annotations(image_id);
 CREATE INDEX IF NOT EXISTS idx_annotations_workspace_id ON annotations(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_export_jobs_workspace_id ON export_jobs(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_cvat_tasks_workspace_id ON cvat_tasks(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_embeddings_workspace_scope_model ON embeddings(workspace_id, scope, model_id);
+CREATE INDEX IF NOT EXISTS idx_embedding_projections_workspace_scope_model ON embedding_projections(workspace_id, scope, model_id);
+CREATE INDEX IF NOT EXISTS idx_dataset_review_marks_workspace_scope ON dataset_review_marks(workspace_id, scope);
+
+CREATE TABLE IF NOT EXISTS sample_sets (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    coverage_method TEXT NOT NULL,
+    params_json TEXT NOT NULL,
+    target_images INTEGER,
+    target_ratio REAL,
+    selected_images INTEGER NOT NULL,
+    selected_objects INTEGER NOT NULL,
+    excluded_outliers INTEGER NOT NULL,
+    saturated INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    UNIQUE(workspace_id, name),
+    FOREIGN KEY(workspace_id) REFERENCES workspace_meta(id)
+);
+
+CREATE TABLE IF NOT EXISTS sample_set_members (
+    id TEXT PRIMARY KEY,
+    sample_set_id TEXT NOT NULL,
+    image_id TEXT NOT NULL,
+    membership TEXT NOT NULL,
+    trigger_object_id TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(sample_set_id, image_id),
+    FOREIGN KEY(sample_set_id) REFERENCES sample_sets(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sample_set_members_set ON sample_set_members(sample_set_id);
 "#;
 
 pub fn initialize_database(db_path: &Path) -> Result<(), String> {
@@ -496,6 +633,714 @@ pub fn read_browser_payload(db_path: &Path) -> Result<BrowserPayload, String> {
         categories: read_browser_categories(db_path)?,
         images: read_image_cards(db_path)?,
     })
+}
+
+pub fn read_dataset_map_points(
+    db_path: &Path,
+    workspace_id: &str,
+    scope: &str,
+    model_id: &str,
+) -> Result<Vec<DatasetMapPoint>, String> {
+    let connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT
+                p.target_id,
+                p.scope,
+                i.id,
+                i.file_name,
+                i.source_id,
+                COALESCE(sf.path, ''),
+                a.id,
+                COALESCE(a.category_id, a.source_category_id),
+                COALESCE(uc.name, sc.name),
+                a.bbox_x,
+                a.bbox_y,
+                a.bbox_width,
+                a.bbox_height,
+                i.width,
+                i.height,
+                p.x,
+                p.y,
+                COALESCE(r.status, 'unreviewed')
+            FROM embedding_projections p
+            LEFT JOIN annotations a
+                ON p.scope = 'object'
+                AND a.id = p.target_id
+                AND a.workspace_id = p.workspace_id
+            LEFT JOIN images i
+                ON i.workspace_id = p.workspace_id
+                AND (
+                    (p.scope = 'image' AND i.id = p.target_id)
+                    OR (p.scope = 'object' AND i.id = a.image_id)
+                )
+            LEFT JOIN source_folders sf ON sf.id = i.source_id
+            LEFT JOIN categories uc ON uc.id = a.category_id
+            LEFT JOIN categories sc ON sc.id = a.source_category_id
+            LEFT JOIN dataset_review_marks r
+                ON r.workspace_id = p.workspace_id
+                AND r.scope = p.scope
+                AND r.target_id = p.target_id
+            WHERE p.workspace_id = ?1
+                AND p.scope = ?2
+                AND p.model_id = ?3
+                AND p.projection_method = (
+                    SELECT p2.projection_method
+                    FROM embedding_projections p2
+                    WHERE p2.workspace_id = p.workspace_id
+                        AND p2.scope = p.scope
+                        AND p2.target_id = p.target_id
+                        AND p2.model_id = p.model_id
+                    ORDER BY
+                        CASE p2.projection_method
+                            WHEN 'umap-v1' THEN 0
+                            WHEN 'pca-v1' THEN 1
+                            WHEN 'bootstrap-deterministic' THEN 2
+                            ELSE 3
+                        END,
+                        p2.created_at DESC
+                    LIMIT 1
+                )
+                AND i.id IS NOT NULL
+            ORDER BY i.file_name ASC, p.target_id ASC
+            "#,
+        )
+        .map_err(|error| format!("failed to prepare dataset map points query: {error}"))?;
+
+    let rows = statement
+        .query_map(params![workspace_id, scope, model_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<f64>>(9)?,
+                row.get::<_, Option<f64>>(10)?,
+                row.get::<_, Option<f64>>(11)?,
+                row.get::<_, Option<f64>>(12)?,
+                row.get::<_, Option<u32>>(13)?,
+                row.get::<_, Option<u32>>(14)?,
+                row.get::<_, f64>(15)?,
+                row.get::<_, f64>(16)?,
+                row.get::<_, String>(17)?,
+            ))
+        })
+        .map_err(|error| format!("failed to read dataset map point rows: {error}"))?;
+
+    let mut points = Vec::new();
+    for row in rows {
+        let (
+            target_id,
+            scope,
+            image_id,
+            filename,
+            source_id,
+            source_path,
+            annotation_id,
+            category_id,
+            category_name,
+            bbox_x,
+            bbox_y,
+            bbox_width,
+            bbox_height,
+            image_width,
+            image_height,
+            x,
+            y,
+            review_status,
+        ) = row.map_err(|error| format!("failed to map dataset map point row: {error}"))?;
+
+        let bbox = match (bbox_x, bbox_y, bbox_width, bbox_height) {
+            (Some(x), Some(y), Some(width), Some(height)) => {
+                let area_ratio = image_width
+                    .zip(image_height)
+                    .and_then(|(image_width, image_height)| {
+                        let image_area = (image_width as f64) * (image_height as f64);
+                        if image_area > 0.0 {
+                            Some((width * height) / image_area)
+                        } else {
+                            None
+                        }
+                    });
+
+                Some(DatasetMapBbox {
+                    x,
+                    y,
+                    width,
+                    height,
+                    area_ratio,
+                })
+            }
+            _ => None,
+        };
+
+        let source_name = Path::new(&source_path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(&source_id)
+            .to_string();
+
+        points.push(DatasetMapPoint {
+            id: target_id,
+            scope,
+            image_id,
+            annotation_id,
+            filename,
+            source_id,
+            source_name,
+            category_id,
+            category_name,
+            bbox,
+            x,
+            y,
+            review_status,
+        });
+    }
+
+    Ok(points)
+}
+
+pub fn read_dataset_map_projection_targets(
+    db_path: &Path,
+    workspace_id: &str,
+    scope: &str,
+) -> Result<Vec<DatasetMapProjectionTarget>, String> {
+    let connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+
+    let sql = match scope {
+        "object" => {
+            r#"
+            SELECT a.id
+            FROM annotations a
+            INNER JOIN images i ON i.id = a.image_id
+            WHERE a.workspace_id = ?1
+            ORDER BY i.file_name ASC, a.id ASC
+            "#
+        }
+        "image" => {
+            r#"
+            SELECT i.id
+            FROM images i
+            WHERE i.workspace_id = ?1
+                AND EXISTS (
+                    SELECT 1
+                    FROM annotations a
+                    WHERE a.image_id = i.id
+                )
+            ORDER BY i.file_name ASC, i.id ASC
+            "#
+        }
+        other => return Err(format!("unsupported dataset map scope '{other}'")),
+    };
+
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|error| format!("failed to prepare dataset map projection target query: {error}"))?;
+    let rows = statement
+        .query_map(params![workspace_id], |row| {
+            Ok(DatasetMapProjectionTarget {
+                target_id: row.get(0)?,
+            })
+        })
+        .map_err(|error| format!("failed to read dataset map projection targets: {error}"))?;
+
+    let mut targets = Vec::new();
+    for row in rows {
+        targets.push(row.map_err(|error| format!("failed to map dataset map projection target: {error}"))?);
+    }
+
+    Ok(targets)
+}
+
+pub fn upsert_embedding_projections(
+    db_path: &Path,
+    projections: &[EmbeddingProjectionRow],
+) -> Result<(), String> {
+    let mut connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("failed to start embedding projection transaction: {error}"))?;
+
+    for projection in projections {
+        transaction
+            .execute(
+                r#"
+                INSERT INTO embedding_projections (
+                    id,
+                    workspace_id,
+                    scope,
+                    target_id,
+                    model_id,
+                    projection_method,
+                    x,
+                    y,
+                    created_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(workspace_id, scope, target_id, model_id, projection_method)
+                DO UPDATE SET
+                    x = excluded.x,
+                    y = excluded.y,
+                    created_at = excluded.created_at
+                "#,
+                params![
+                    projection.id,
+                    projection.workspace_id,
+                    projection.scope,
+                    projection.target_id,
+                    projection.model_id,
+                    projection.projection_method,
+                    projection.x,
+                    projection.y,
+                    projection.created_at,
+                ],
+            )
+            .map_err(|error| format!("failed to upsert embedding projection: {error}"))?;
+    }
+
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit embedding projection transaction: {error}"))?;
+
+    Ok(())
+}
+
+pub fn read_sample_sets(db_path: &Path, workspace_id: &str) -> Result<Vec<SampleSet>, String> {
+    let connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT id, name, scope, model_id, coverage_method, target_images, target_ratio,
+                   selected_images, selected_objects, excluded_outliers, saturated, created_at
+            FROM sample_sets
+            WHERE workspace_id = ?1
+            ORDER BY created_at DESC
+            "#,
+        )
+        .map_err(|error| format!("failed to prepare sample set query: {error}"))?;
+
+    let rows = statement
+        .query_map(params![workspace_id], |row| {
+            Ok(SampleSet {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                scope: row.get(2)?,
+                model_id: row.get(3)?,
+                mode: row.get(4)?,
+                target_images: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
+                target_ratio: row.get(6)?,
+                selected_images: row.get::<_, i64>(7)? as u32,
+                selected_objects: row.get::<_, i64>(8)? as u32,
+                excluded_outliers: row.get::<_, i64>(9)? as u32,
+                saturated: row.get::<_, i64>(10)? != 0,
+                created_at: row.get(11)?,
+            })
+        })
+        .map_err(|error| format!("failed to read sample sets: {error}"))?;
+
+    let mut sets = Vec::new();
+    for row in rows {
+        sets.push(row.map_err(|error| format!("failed to map sample set: {error}"))?);
+    }
+    Ok(sets)
+}
+
+pub fn read_sample_set_members(
+    db_path: &Path,
+    workspace_id: &str,
+    name: &str,
+) -> Result<SampleSetMembers, String> {
+    let connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT m.image_id, m.trigger_object_id
+            FROM sample_set_members m
+            JOIN sample_sets s ON s.id = m.sample_set_id
+            WHERE s.workspace_id = ?1 AND s.name = ?2 AND m.membership = 'selected'
+            ORDER BY m.image_id
+            "#,
+        )
+        .map_err(|error| format!("failed to prepare sample set members query: {error}"))?;
+
+    let rows = statement
+        .query_map(params![workspace_id, name], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|error| format!("failed to read sample set members: {error}"))?;
+
+    let mut image_ids = Vec::new();
+    let mut object_ids = Vec::new();
+    for row in rows {
+        let (image_id, object_id) =
+            row.map_err(|error| format!("failed to map sample set member: {error}"))?;
+        image_ids.push(image_id);
+        if let Some(object_id) = object_id {
+            object_ids.push(object_id);
+        }
+    }
+    Ok(SampleSetMembers {
+        image_ids,
+        object_ids,
+    })
+}
+
+pub fn delete_sample_set(db_path: &Path, workspace_id: &str, name: &str) -> Result<(), String> {
+    let mut connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("failed to start delete sample set transaction: {error}"))?;
+
+    transaction
+        .execute(
+            r#"
+            DELETE FROM sample_set_members
+            WHERE sample_set_id IN (
+                SELECT id FROM sample_sets WHERE workspace_id = ?1 AND name = ?2
+            )
+            "#,
+            params![workspace_id, name],
+        )
+        .map_err(|error| format!("failed to delete sample set members: {error}"))?;
+    transaction
+        .execute(
+            "DELETE FROM sample_sets WHERE workspace_id = ?1 AND name = ?2",
+            params![workspace_id, name],
+        )
+        .map_err(|error| format!("failed to delete sample set: {error}"))?;
+
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit delete sample set transaction: {error}"))?;
+    Ok(())
+}
+
+pub fn read_embedding_vectors_for_projection(
+    db_path: &Path,
+    workspace_id: &str,
+    scope: &str,
+    model_id: &str,
+) -> Result<Vec<EmbeddingVectorRow>, String> {
+    let connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT target_id, vector
+            FROM embeddings
+            WHERE workspace_id = ?1
+                AND scope = ?2
+                AND model_id = ?3
+            ORDER BY target_id ASC
+            "#,
+        )
+        .map_err(|error| format!("failed to prepare embedding vector query: {error}"))?;
+
+    let rows = statement
+        .query_map(params![workspace_id, scope, model_id], |row| {
+            let bytes: Vec<u8> = row.get(1)?;
+            Ok((row.get::<_, String>(0)?, bytes))
+        })
+        .map_err(|error| format!("failed to read embedding vector rows: {error}"))?;
+
+    let mut vectors = Vec::new();
+    for row in rows {
+        let (target_id, bytes) = row.map_err(|error| format!("failed to map embedding vector row: {error}"))?;
+        vectors.push(EmbeddingVectorRow {
+            target_id,
+            vector: deserialize_f32_vector(&bytes)?,
+        });
+    }
+
+    Ok(vectors)
+}
+
+fn deserialize_f32_vector(bytes: &[u8]) -> Result<Vec<f32>, String> {
+    if bytes.len() % 4 != 0 {
+        return Err(format!(
+            "embedding vector byte length must be divisible by 4, got {}",
+            bytes.len()
+        ));
+    }
+
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+pub fn upsert_dataset_review_marks(
+    db_path: &Path,
+    workspace_id: &str,
+    scope: &str,
+    updates: &[DatasetReviewUpdate],
+    updated_at: &str,
+) -> Result<(), String> {
+    let mut connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("failed to start dataset review mark transaction: {error}"))?;
+
+    for update in updates {
+        transaction
+            .execute(
+                r#"
+                INSERT INTO dataset_review_marks (
+                    id,
+                    workspace_id,
+                    scope,
+                    target_id,
+                    status,
+                    reason,
+                    note,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+                ON CONFLICT(workspace_id, scope, target_id)
+                DO UPDATE SET
+                    status = excluded.status,
+                    reason = excluded.reason,
+                    note = excluded.note,
+                    updated_at = excluded.updated_at
+                "#,
+                params![
+                    format!("review-{workspace_id}-{scope}-{}", update.target_id),
+                    workspace_id,
+                    scope,
+                    &update.target_id,
+                    &update.status,
+                    update.reason.as_deref(),
+                    update.note.as_deref(),
+                    updated_at,
+                ],
+            )
+            .map_err(|error| format!("failed to upsert dataset review mark: {error}"))?;
+    }
+
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit dataset review mark transaction: {error}"))?;
+
+    Ok(())
+}
+
+pub fn read_dataset_map_export_exclusions(
+    db_path: &Path,
+    workspace_id: &str,
+) -> Result<DatasetMapExportExclusions, String> {
+    let connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT scope, target_id
+            FROM dataset_review_marks
+            WHERE workspace_id = ?1
+                AND status = 'exclude'
+                AND scope IN ('image', 'object')
+            "#,
+        )
+        .map_err(|error| format!("failed to prepare dataset map export exclusions query: {error}"))?;
+
+    let rows = statement
+        .query_map(params![workspace_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("failed to read dataset map export exclusions: {error}"))?;
+
+    let mut exclusions = DatasetMapExportExclusions {
+        image_ids: HashSet::new(),
+        annotation_ids: HashSet::new(),
+    };
+
+    for row in rows {
+        let (scope, target_id) = row
+            .map_err(|error| format!("failed to map dataset map export exclusion row: {error}"))?;
+        match scope.as_str() {
+            "image" => {
+                exclusions.image_ids.insert(target_id);
+            }
+            "object" => {
+                exclusions.annotation_ids.insert(target_id);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(exclusions)
+}
+
+pub fn read_embedding_job_items(
+    db_path: &Path,
+    workspace_id: &str,
+    scope: &str,
+) -> Result<Vec<EmbeddingJobItem>, String> {
+    let connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+
+    let sql = match scope {
+        "object" => {
+            r#"
+            SELECT
+                a.id,
+                i.id,
+                a.id,
+                i.original_path,
+                a.bbox_x,
+                a.bbox_y,
+                a.bbox_width,
+                a.bbox_height
+            FROM annotations a
+            INNER JOIN images i ON i.id = a.image_id
+            WHERE a.workspace_id = ?1
+                AND i.health_status = 'healthy'
+            ORDER BY i.file_name ASC, a.id ASC
+            "#
+        }
+        "image" => {
+            r#"
+            SELECT
+                i.id,
+                i.id,
+                NULL,
+                i.original_path,
+                NULL,
+                NULL,
+                NULL,
+                NULL
+            FROM images i
+            WHERE i.workspace_id = ?1
+                AND i.health_status = 'healthy'
+                AND EXISTS (
+                    SELECT 1
+                    FROM annotations a
+                    WHERE a.image_id = i.id
+                )
+            ORDER BY i.file_name ASC, i.id ASC
+            "#
+        }
+        other => return Err(format!("unsupported embedding job scope '{other}'")),
+    };
+
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|error| format!("failed to prepare embedding job item query: {error}"))?;
+    let rows = statement
+        .query_map(params![workspace_id], |row| {
+            let bbox = match (
+                row.get::<_, Option<f64>>(4)?,
+                row.get::<_, Option<f64>>(5)?,
+                row.get::<_, Option<f64>>(6)?,
+                row.get::<_, Option<f64>>(7)?,
+            ) {
+                (Some(x), Some(y), Some(width), Some(height)) => Some(CropRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                }),
+                _ => None,
+            };
+
+            Ok(EmbeddingJobItem {
+                target_id: row.get(0)?,
+                image_id: row.get(1)?,
+                annotation_id: row.get(2)?,
+                original_path: row.get(3)?,
+                bbox,
+            })
+        })
+        .map_err(|error| format!("failed to read embedding job item rows: {error}"))?;
+
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row.map_err(|error| format!("failed to map embedding job item: {error}"))?);
+    }
+
+    Ok(items)
+}
+
+pub fn upsert_embeddings(db_path: &Path, records: &[EmbeddingRecord]) -> Result<(), String> {
+    let mut connection = Connection::open(db_path)
+        .map_err(|error| format!("failed to open workspace database: {error}"))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("failed to start embedding transaction: {error}"))?;
+
+    for record in records {
+        let vector = serialize_f32_vector(&record.vector);
+        let vector_norm = record
+            .vector
+            .iter()
+            .map(|value| (*value as f64) * (*value as f64))
+            .sum::<f64>()
+            .sqrt();
+
+        transaction
+            .execute(
+                r#"
+                INSERT INTO embeddings (
+                    id,
+                    workspace_id,
+                    scope,
+                    target_id,
+                    image_id,
+                    annotation_id,
+                    model_id,
+                    runtime_backend,
+                    vector,
+                    vector_norm,
+                    created_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ON CONFLICT(workspace_id, scope, target_id, model_id)
+                DO UPDATE SET
+                    image_id = excluded.image_id,
+                    annotation_id = excluded.annotation_id,
+                    runtime_backend = excluded.runtime_backend,
+                    vector = excluded.vector,
+                    vector_norm = excluded.vector_norm,
+                    created_at = excluded.created_at
+                "#,
+                params![
+                    format!(
+                        "embedding-{}-{}-{}-{}",
+                        record.workspace_id, record.scope, record.model_id, record.target_id
+                    ),
+                    &record.workspace_id,
+                    &record.scope,
+                    &record.target_id,
+                    &record.image_id,
+                    record.annotation_id.as_deref(),
+                    &record.model_id,
+                    &record.runtime_backend,
+                    vector,
+                    vector_norm,
+                    &record.created_at,
+                ],
+            )
+            .map_err(|error| format!("failed to upsert embedding: {error}"))?;
+    }
+
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit embedding transaction: {error}"))?;
+
+    Ok(())
 }
 
 pub fn read_import_review_rows(db_path: &Path) -> Result<Vec<ImportReviewRow>, String> {
@@ -1417,6 +2262,8 @@ pub fn read_export_preview(db_path: &Path, default_output_path: &str) -> Result<
         included_images,
         excluded_images,
         included_boxes,
+        dataset_map_excluded_images: 0,
+        dataset_map_excluded_boxes: 0,
         filename_conflicts,
         conflict_details,
         split_counts: crate::models::SplitCounts { train, valid, test },
@@ -1575,6 +2422,7 @@ pub fn read_export_images(db_path: &Path) -> Result<Vec<ExportImageRecord>, Stri
             i.original_path,
             i.width,
             i.height,
+            a.id,
             COALESCE(uc.id, COALESCE(NULLIF(sc.normalized_name, ''), LOWER(sc.name))),
             COALESCE(uc.name, sc.name),
             a.annotation_format,
@@ -1597,6 +2445,7 @@ pub fn read_export_images(db_path: &Path) -> Result<Vec<ExportImageRecord>, Stri
             i.original_path,
             i.width,
             i.height,
+            a.id,
             COALESCE(NULLIF(sc.normalized_name, ''), LOWER(sc.name)),
             sc.name,
             a.annotation_format,
@@ -1623,13 +2472,14 @@ pub fn read_export_images(db_path: &Path) -> Result<Vec<ExportImageRecord>, Stri
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<u32>>(3)?,
                 row.get::<_, Option<u32>>(4)?,
-                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(5)?,
                 row.get::<_, Option<String>>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, f64>(8)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
                 row.get::<_, f64>(9)?,
                 row.get::<_, f64>(10)?,
                 row.get::<_, f64>(11)?,
+                row.get::<_, f64>(12)?,
             ))
         })
         .map_err(|error| format!("failed to read export rows: {error}"))?;
@@ -1642,6 +2492,7 @@ pub fn read_export_images(db_path: &Path) -> Result<Vec<ExportImageRecord>, Stri
             original_path,
             width,
             height,
+            annotation_id,
             category_key,
             category_name,
             annotation_format,
@@ -1662,6 +2513,7 @@ pub fn read_export_images(db_path: &Path) -> Result<Vec<ExportImageRecord>, Stri
 
         if let (Some(category_key), Some(category_name)) = (category_key, category_name) {
             image_entry.annotations.push(ExportAnnotationRecord {
+                id: annotation_id,
                 category_key,
                 category_name,
                 annotation_format,
@@ -2159,6 +3011,431 @@ fn slugify_name(value: &str) -> String {
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>()
         .join("-")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initialize_database_creates_dataset_map_tables() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("dataviewer-db-schema-{timestamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("workspace.db");
+
+        initialize_database(&db_path).unwrap();
+
+        let connection = Connection::open(&db_path).unwrap();
+        for table_name in [
+            "embedding_models",
+            "embedding_jobs",
+            "embeddings",
+            "embedding_projections",
+            "dataset_review_marks",
+        ] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(1) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table_name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing table {table_name}");
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn upsert_embedding_projections_can_feed_dataset_map_points() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("dataviewer-map-points-{timestamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("workspace.db");
+        initialize_database(&db_path).unwrap();
+
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspace_meta (id, name, workspace_path, created_at, updated_at, app_version) VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+                params!["ws-1", "Workspace", "D:\\workspace", "2026-06-17T00:00:00Z", APP_VERSION],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO source_folders (id, workspace_id, path, source_type, status, last_scan_at, image_count, category_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params!["source-1", "ws-1", "D:\\datasets\\source-1", "COCO", "ready", "2026-06-17T00:00:00Z", 1, 1],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images (id, workspace_id, source_id, file_name, original_path, width, height, annotation_status, health_status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                params!["image-1", "ws-1", "source-1", "frame.jpg", "D:\\datasets\\source-1\\frame.jpg", 100, 50, "annotated", "healthy", "2026-06-17T00:00:00Z"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO categories (id, workspace_id, source_id, name, normalized_name, category_role, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                params!["cat-1", "ws-1", "source-1", "screw", "screw", "source", "2026-06-17T00:00:00Z"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO annotations (id, workspace_id, image_id, source_id, source_category_id, bbox_x, bbox_y, bbox_width, bbox_height, annotation_format, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                params!["ann-1", "ws-1", "image-1", "source-1", "cat-1", 10.0, 5.0, 20.0, 10.0, "coco", "2026-06-17T00:00:00Z"],
+            )
+            .unwrap();
+
+        upsert_embedding_projections(
+            &db_path,
+            &[EmbeddingProjectionRow {
+                id: "projection-1".into(),
+                workspace_id: "ws-1".into(),
+                scope: "object".into(),
+                target_id: "ann-1".into(),
+                model_id: "clip-vit-b32".into(),
+                projection_method: "bootstrap-deterministic".into(),
+                x: 0.25,
+                y: -0.5,
+                created_at: "2026-06-17T00:00:00Z".into(),
+            }],
+        )
+        .unwrap();
+
+        let points =
+            read_dataset_map_points(&db_path, "ws-1", "object", "clip-vit-b32").unwrap();
+
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].id, "ann-1");
+        assert_eq!(points[0].image_id, "image-1");
+        assert_eq!(points[0].category_name.as_deref(), Some("screw"));
+        assert_eq!(points[0].review_status, "unreviewed");
+        assert_eq!(points[0].bbox.as_ref().and_then(|bbox| bbox.area_ratio), Some(0.04));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn upsert_dataset_review_marks_updates_existing_mark() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("dataviewer-review-marks-{timestamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("workspace.db");
+        initialize_database(&db_path).unwrap();
+
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspace_meta (id, name, workspace_path, created_at, updated_at, app_version) VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+                params!["ws-1", "Workspace", "D:\\workspace", "2026-06-17T00:00:00Z", APP_VERSION],
+            )
+            .unwrap();
+
+        upsert_dataset_review_marks(
+            &db_path,
+            "ws-1",
+            "object",
+            &[DatasetReviewUpdate {
+                target_id: "ann-1".into(),
+                status: "needs-review".into(),
+                reason: None,
+                note: None,
+            }],
+            "2026-06-17T00:00:00Z",
+        )
+        .unwrap();
+        upsert_dataset_review_marks(
+            &db_path,
+            "ws-1",
+            "object",
+            &[DatasetReviewUpdate {
+                target_id: "ann-1".into(),
+                status: "exclude".into(),
+                reason: Some("bad crop".into()),
+                note: Some("too blurry".into()),
+            }],
+            "2026-06-17T00:01:00Z",
+        )
+        .unwrap();
+
+        let row = connection
+            .query_row(
+                "SELECT status, reason, note, updated_at FROM dataset_review_marks WHERE workspace_id = ?1 AND scope = ?2 AND target_id = ?3",
+                params!["ws-1", "object", "ann-1"],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(row.0, "exclude");
+        assert_eq!(row.1.as_deref(), Some("bad crop"));
+        assert_eq!(row.2.as_deref(), Some("too blurry"));
+        assert_eq!(row.3, "2026-06-17T00:01:00Z");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_dataset_map_export_exclusions_returns_excluded_image_and_object_ids() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("dataviewer-export-exclusions-{timestamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("workspace.db");
+        initialize_database(&db_path).unwrap();
+        seed_single_annotated_image(&db_path);
+
+        upsert_dataset_review_marks(
+            &db_path,
+            "ws-1",
+            "image",
+            &[DatasetReviewUpdate {
+                target_id: "image-1".into(),
+                status: "exclude".into(),
+                reason: None,
+                note: None,
+            }],
+            "2026-06-17T00:00:00Z",
+        )
+        .unwrap();
+        upsert_dataset_review_marks(
+            &db_path,
+            "ws-1",
+            "object",
+            &[DatasetReviewUpdate {
+                target_id: "ann-1".into(),
+                status: "exclude".into(),
+                reason: None,
+                note: None,
+            }],
+            "2026-06-17T00:00:01Z",
+        )
+        .unwrap();
+
+        let exclusions = read_dataset_map_export_exclusions(&db_path, "ws-1").unwrap();
+
+        assert!(exclusions.image_ids.contains("image-1"));
+        assert!(exclusions.annotation_ids.contains("ann-1"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_embedding_job_items_builds_object_and_image_manifests() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("dataviewer-job-items-{timestamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("workspace.db");
+        initialize_database(&db_path).unwrap();
+
+        seed_single_annotated_image(&db_path);
+
+        let object_items = read_embedding_job_items(&db_path, "ws-1", "object").unwrap();
+        let image_items = read_embedding_job_items(&db_path, "ws-1", "image").unwrap();
+
+        assert_eq!(object_items.len(), 1);
+        assert_eq!(object_items[0].target_id, "ann-1");
+        assert_eq!(object_items[0].annotation_id.as_deref(), Some("ann-1"));
+        assert!(object_items[0].bbox.is_some());
+        assert_eq!(image_items.len(), 1);
+        assert_eq!(image_items[0].target_id, "image-1");
+        assert_eq!(image_items[0].annotation_id, None);
+        assert!(image_items[0].bbox.is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn upsert_embeddings_stores_vector_blob() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("dataviewer-embeddings-{timestamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("workspace.db");
+        initialize_database(&db_path).unwrap();
+
+        seed_single_annotated_image(&db_path);
+
+        upsert_embeddings(
+            &db_path,
+            &[crate::embedding::jobs::EmbeddingRecord {
+                workspace_id: "ws-1".into(),
+                scope: "object".into(),
+                target_id: "ann-1".into(),
+                image_id: "image-1".into(),
+                annotation_id: Some("ann-1".into()),
+                model_id: "clip-vit-b32".into(),
+                runtime_backend: "cpu".into(),
+                vector: vec![1.0, -2.5],
+                created_at: "2026-06-17T00:00:00Z".into(),
+            }],
+        )
+        .unwrap();
+
+        let connection = Connection::open(&db_path).unwrap();
+        let blob: Vec<u8> = connection
+            .query_row(
+                "SELECT vector FROM embeddings WHERE workspace_id = ?1 AND scope = ?2 AND target_id = ?3",
+                params!["ws-1", "object", "ann-1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(blob, crate::embedding::jobs::serialize_f32_vector(&[1.0, -2.5]));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_embedding_vectors_for_projection_decodes_little_endian_vectors() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("dataviewer-projection-vectors-{timestamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("workspace.db");
+        initialize_database(&db_path).unwrap();
+
+        seed_single_annotated_image(&db_path);
+        upsert_embeddings(
+            &db_path,
+            &[crate::embedding::jobs::EmbeddingRecord {
+                workspace_id: "ws-1".into(),
+                scope: "object".into(),
+                target_id: "ann-1".into(),
+                image_id: "image-1".into(),
+                annotation_id: Some("ann-1".into()),
+                model_id: "clip-vit-b32".into(),
+                runtime_backend: "cpu".into(),
+                vector: vec![0.25, -0.5, 1.0],
+                created_at: "2026-06-17T00:00:00Z".into(),
+            }],
+        )
+        .unwrap();
+
+        let rows = read_embedding_vectors_for_projection(
+            &db_path,
+            "ws-1",
+            "object",
+            "clip-vit-b32",
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target_id, "ann-1");
+        assert_eq!(rows[0].vector, vec![0.25, -0.5, 1.0]);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_dataset_map_points_prefers_pca_projection_over_bootstrap() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("dataviewer-pca-point-priority-{timestamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("workspace.db");
+        initialize_database(&db_path).unwrap();
+        seed_single_annotated_image(&db_path);
+
+        upsert_embedding_projections(
+            &db_path,
+            &[
+                EmbeddingProjectionRow {
+                    id: "projection-bootstrap".to_string(),
+                    workspace_id: "ws-1".to_string(),
+                    scope: "object".to_string(),
+                    target_id: "ann-1".to_string(),
+                    model_id: "clip-vit-b32".to_string(),
+                    projection_method: "bootstrap-deterministic".to_string(),
+                    x: -0.8,
+                    y: -0.7,
+                    created_at: "2026-06-17T00:00:00Z".to_string(),
+                },
+                EmbeddingProjectionRow {
+                    id: "projection-pca".to_string(),
+                    workspace_id: "ws-1".to_string(),
+                    scope: "object".to_string(),
+                    target_id: "ann-1".to_string(),
+                    model_id: "clip-vit-b32".to_string(),
+                    projection_method: "pca-v1".to_string(),
+                    x: 0.25,
+                    y: 0.5,
+                    created_at: "2026-06-17T00:00:01Z".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let points = read_dataset_map_points(&db_path, "ws-1", "object", "clip-vit-b32").unwrap();
+
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].id, "ann-1");
+        assert_eq!(points[0].x, 0.25);
+        assert_eq!(points[0].y, 0.5);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn seed_single_annotated_image(db_path: &Path) {
+        let connection = Connection::open(db_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspace_meta (id, name, workspace_path, created_at, updated_at, app_version) VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+                params!["ws-1", "Workspace", "D:\\workspace", "2026-06-17T00:00:00Z", APP_VERSION],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO source_folders (id, workspace_id, path, source_type, status, last_scan_at, image_count, category_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params!["source-1", "ws-1", "D:\\datasets\\source-1", "COCO", "ready", "2026-06-17T00:00:00Z", 1, 1],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images (id, workspace_id, source_id, file_name, original_path, width, height, annotation_status, health_status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                params!["image-1", "ws-1", "source-1", "frame.jpg", "D:\\datasets\\source-1\\frame.jpg", 100, 50, "annotated", "healthy", "2026-06-17T00:00:00Z"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO categories (id, workspace_id, source_id, name, normalized_name, category_role, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                params!["cat-1", "ws-1", "source-1", "screw", "screw", "source", "2026-06-17T00:00:00Z"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO annotations (id, workspace_id, image_id, source_id, source_category_id, bbox_x, bbox_y, bbox_width, bbox_height, annotation_format, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                params!["ann-1", "ws-1", "image-1", "source-1", "cat-1", 10.0, 5.0, 20.0, 10.0, "coco", "2026-06-17T00:00:00Z"],
+            )
+            .unwrap();
+    }
 }
 
 

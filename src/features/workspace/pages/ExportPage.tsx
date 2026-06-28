@@ -4,7 +4,14 @@ import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { Panel } from "../../../components/ui/Panel";
 import { StatCard } from "../../../components/ui/StatCard";
-import { getBrowserPayload, getExportPreview, openExportFolder, startExport } from "../../../lib/api";
+import {
+  getBrowserPayload,
+  getExportPreview,
+  getSampleSetMembers,
+  listSampleSets,
+  openExportFolder,
+  startExport,
+} from "../../../lib/api";
 import { describeError, pickFolder } from "../../../lib/tauri";
 import { useWorkspaceStore } from "../../../state/useWorkspaceStore";
 import { ExportScopeMode, resolveExportScopeImages } from "../browserScope";
@@ -103,16 +110,35 @@ export function ExportPage() {
       selectedSourceIds,
     ],
   );
-  const exportImageIds = useMemo(() => scopedImages.map((image) => image.id), [scopedImages]);
+  const browserImageIds = useMemo(() => scopedImages.map((image) => image.id), [scopedImages]);
+
+  const [sampleSetName, setSampleSetName] = useState("");
+
+  const sampleSetsQuery = useQuery({
+    queryKey: ["sample-sets", workspaceId],
+    queryFn: () => listSampleSets(workspaceId),
+  });
+
+  const sampleMembersQuery = useQuery({
+    queryKey: ["sample-set-members", workspaceId, sampleSetName],
+    queryFn: () => getSampleSetMembers(workspaceId, sampleSetName),
+    enabled: sampleSetName !== "",
+  });
+
+  // When a sample set is chosen it overrides the Browser scope.
+  const exportImageIds = useMemo(
+    () => (sampleSetName ? sampleMembersQuery.data?.imageIds ?? [] : browserImageIds),
+    [sampleSetName, sampleMembersQuery.data, browserImageIds],
+  );
 
   const { data } = useQuery({
-    queryKey: ["export-preview", workspaceId, scopeMode, exportImageIds],
+    queryKey: ["export-preview", workspaceId, scopeMode, sampleSetName, exportImageIds],
     queryFn: () =>
       getExportPreview({
         workspaceId,
         imageIds: exportImageIds,
       }),
-    enabled: !!browserPayload,
+    enabled: !!browserPayload && (sampleSetName === "" || sampleMembersQuery.isSuccess),
   });
 
   const [outputFormat, setOutputFormat] = useState("COCO");
@@ -123,6 +149,7 @@ export function ExportPage() {
   const [outputPath, setOutputPath] = useState("");
   const [lastSuggestedPath, setLastSuggestedPath] = useState("");
   const [allowAutoRenameConflicts, setAllowAutoRenameConflicts] = useState(true);
+  const [excludeDatasetMapItems, setExcludeDatasetMapItems] = useState(false);
   const [errorDetail, setErrorDetail] = useState("");
   const [folderOpenError, setFolderOpenError] = useState("");
 
@@ -137,6 +164,7 @@ export function ExportPage() {
         randomSeed: Number(randomSeed),
         outputPath,
         allowAutoRenameConflicts,
+        excludeDatasetMapItems,
         imageIds: exportImageIds,
       }),
     onMutate: () => {
@@ -294,10 +322,29 @@ export function ExportPage() {
         </div>
       ) : null}
 
-      {scopeSummary.totalCount === 0 ? (
+      {data.datasetMapExcludedImages > 0 || data.datasetMapExcludedBoxes > 0 ? (
+        <div className="status-banner status-banner-warning">
+          <strong>Dataset Map exclusions detected.</strong>
+          <span>
+            {data.datasetMapExcludedImages} images and {data.datasetMapExcludedBoxes} boxes are marked exclude. Export output is unchanged unless the Dataset Map exclusion option is enabled.
+          </span>
+        </div>
+      ) : null}
+
+      {scopeSummary.totalCount === 0 && !sampleSetName ? (
         <div className="status-banner status-banner-warning">
           <strong>No images in the current export scope.</strong>
           <span>Go back to Browser to adjust filters or select images first.</span>
+        </div>
+      ) : null}
+
+      {sampleSetName ? (
+        <div className="status-banner status-banner-info">
+          <strong>Sample set scope active: {sampleSetName}</strong>
+          <span>
+            Exporting {exportImageIds.length} images from this sample set. Browser scope is ignored.
+            Counts in Export Summary below are authoritative.
+          </span>
         </div>
       ) : null}
 
@@ -360,6 +407,21 @@ export function ExportPage() {
       <Panel title="Export Settings" subtitle="Configure output format, split ratios, conflict handling, and target folder.">
         <div className="export-settings-grid">
           <label className="field">
+            <span>Sample Set</span>
+            <select value={sampleSetName} onChange={(event) => setSampleSetName(event.target.value)}>
+              <option value="">None (use Browser scope)</option>
+              {(sampleSetsQuery.data ?? []).map((set) => (
+                <option key={set.id} value={set.name}>
+                  {set.name} ({set.selectedImages} images)
+                </option>
+              ))}
+            </select>
+            <span className="field-help">
+              Selecting a sample set exports exactly its images and overrides the Browser scope.
+            </span>
+          </label>
+
+          <label className="field">
             <span>Output Format</span>
             <div className="field-inline">
               <label className="radio-row">
@@ -416,6 +478,23 @@ export function ExportPage() {
           </label>
         </div>
 
+        <div className="export-conflict-setting">
+          <div className="export-conflict-copy">
+            <strong>Dataset Map</strong>
+            <span>
+              Apply image-level and object-level exclude marks from Dataset Map to this export.
+            </span>
+          </div>
+          <label className="checkbox-row export-conflict-checkbox">
+            <input
+              checked={excludeDatasetMapItems}
+              onChange={(event) => setExcludeDatasetMapItems(event.target.checked)}
+              type="checkbox"
+            />
+            <span>Exclude items marked exclude in Dataset Map</span>
+          </label>
+        </div>
+
         <div className="button-row">
           <button className="button button-secondary" onClick={() => navigate(`/workspace/${workspaceId}/browser`)} type="button">
             Adjust Browser Scope
@@ -424,7 +503,7 @@ export function ExportPage() {
             className="button button-primary"
             disabled={
               exportMutation.isPending ||
-              scopeSummary.totalCount === 0 ||
+              (!sampleSetName && scopeSummary.totalCount === 0) ||
               data.includedImages === 0 ||
               (data.filenameConflicts > 0 && !allowAutoRenameConflicts)
             }
@@ -461,6 +540,7 @@ export function ExportPage() {
           <StatCard hint="categories present in exported annotations" label="Categories" value={data.categoryCount} />
           <StatCard hint="annotated images after scope filtering" label="Images Included" value={data.includedImages} />
           <StatCard hint="in scope but not exportable" label="Images Excluded" value={data.excludedImages} />
+          <StatCard hint="opt-in Dataset Map filter" label="Map Excluded" value={data.datasetMapExcludedImages + data.datasetMapExcludedBoxes} />
           <StatCard hint="total annotations" label="Boxes Included" value={data.includedBoxes} />
           <StatCard hint="pending manual review" label="Filename Conflicts" value={data.filenameConflicts} />
         </div>

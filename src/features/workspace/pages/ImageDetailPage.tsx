@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 
 import { Panel } from "../../../components/ui/Panel";
 import { getImageDetail } from "../../../lib/api";
@@ -33,6 +33,11 @@ function formatPercent(value: number | null) {
 
 export function ImageDetailPage() {
   const { workspaceId = "factory-defect-v1", imageId = "" } = useParams();
+  const [searchParams] = useSearchParams();
+  const returnTarget = searchParams.get("from") === "dataset-map" ? "dataset-map" : "browser";
+  const highlightedAnnotationId = searchParams.get("annotationId");
+  const backPath = `/workspace/${workspaceId}/${returnTarget}`;
+  const backLabel = returnTarget === "dataset-map" ? "Back to Dataset Map" : "Back to Browser";
   const { data } = useQuery({
     queryKey: ["image-detail", workspaceId, imageId],
     queryFn: () => getImageDetail(workspaceId, imageId),
@@ -59,16 +64,16 @@ export function ImageDetailPage() {
 
     return data.boxes.map((box, index) => ({
       id: box.id,
-      label: `${index + 1}. ${box.categoryName}`,
+      label: `${index + 1}. ${box.categoryName}${highlightedAnnotationId === box.id ? " (selected)" : ""}`,
       ratioLabel: formatPercent(getBoxAreaRatio(box, imageWidth, imageHeight)),
     }));
-  }, [data, naturalSize]);
+  }, [data, highlightedAnnotationId, naturalSize]);
 
   if (!data) {
     return (
       <Panel title="Image Not Found" subtitle="The selected image is not available in the current mock payload.">
-        <Link className="button button-secondary" to={`/workspace/${workspaceId}/browser`}>
-          Back to Browser
+        <Link className="button button-secondary" to={backPath}>
+          {backLabel}
         </Link>
       </Panel>
     );
@@ -110,8 +115,8 @@ export function ImageDetailPage() {
         title={data.filename}
         subtitle="Single-image inspection view for bounding boxes and source metadata."
         actions={
-          <Link className="button button-secondary" to={`/workspace/${workspaceId}/browser`}>
-            Back
+          <Link className="button button-secondary" to={backPath}>
+            {backLabel}
           </Link>
         }
       >
@@ -138,8 +143,14 @@ export function ImageDetailPage() {
                 return null;
               }
 
+              const isHighlighted = highlightedAnnotationId === box.id;
+
               return (
-                <div className="bbox bbox-real" key={box.id} style={style}>
+                <div
+                  className={`bbox bbox-real${isHighlighted ? " bbox-highlighted" : ""}`}
+                  key={box.id}
+                  style={style}
+                >
                   <span className="bbox-label">{box.categoryName}</span>
                 </div>
               );

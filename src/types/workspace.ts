@@ -213,6 +213,8 @@ export type ExportPreview = {
   includedImages: number;
   excludedImages: number;
   includedBoxes: number;
+  datasetMapExcludedImages: number;
+  datasetMapExcludedBoxes: number;
   filenameConflicts: number;
   conflictDetails: {
     fileName: string;
@@ -246,6 +248,7 @@ export type StartExportInput = {
   randomSeed: number;
   outputPath: string;
   allowAutoRenameConflicts: boolean;
+  excludeDatasetMapItems: boolean;
   imageIds?: string[];
   sourceIds?: string[];
   categoryIds?: string[];
@@ -256,4 +259,142 @@ export type StartExportResult = {
   outputPath: string;
   exportedImages: number;
   exportedBoxes: number;
+};
+
+export type DatasetMapScope = "object" | "image";
+export type EmbeddingFamily = "preview" | "clip" | "dinov2";
+export type EmbeddingRuntimePreference = "auto" | "cuda" | "windows-gpu" | "cpu";
+export type EmbeddingRuntimeBackend = "cuda" | "windows-gpu" | "cpu";
+export type EmbeddingJobStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
+export type DatasetReviewStatus =
+  | "unreviewed"
+  | "needs-review"
+  | "keep"
+  | "fix"
+  | "exclude";
+
+export type EmbeddingModelOption = {
+  id: string;
+  family: EmbeddingFamily;
+  displayName: string;
+  embeddingDim: number;
+  inputSize: number;
+  available: boolean;
+  downloadRequired: boolean;
+};
+
+export type EmbeddingRuntimeCapability = {
+  backend: EmbeddingRuntimeBackend;
+  available: boolean;
+  label: string;
+  detail: string;
+};
+
+export type EmbeddingRuntimeProbe = {
+  preference: EmbeddingRuntimePreference;
+  selectedBackend: EmbeddingRuntimeBackend;
+  capabilities: EmbeddingRuntimeCapability[];
+  fallbackReason?: string | null;
+};
+
+export type DatasetMapPoint = {
+  id: string;
+  scope: DatasetMapScope;
+  imageId: string;
+  annotationId?: string | null;
+  filename: string;
+  sourceId: string;
+  sourceName: string;
+  categoryId?: string | null;
+  categoryName?: string | null;
+  bbox?: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    areaRatio?: number | null;
+  } | null;
+  x: number;
+  y: number;
+  reviewStatus: DatasetReviewStatus;
+};
+
+export type EmbeddingJob = {
+  id: string;
+  workspaceId: string;
+  scope: DatasetMapScope;
+  modelId: string;
+  runtimePreference: EmbeddingRuntimePreference;
+  runtimeBackend?: EmbeddingRuntimeBackend | null;
+  status: EmbeddingJobStatus;
+  processedItems: number;
+  totalItems: number;
+  message?: string | null;
+  updatedAt: string;
+};
+
+export type DatasetMapPayload = {
+  workspaceId: string;
+  scope: DatasetMapScope;
+  modelId: string;
+  models: EmbeddingModelOption[];
+  runtime: EmbeddingRuntimeProbe;
+  points: DatasetMapPoint[];
+  jobs: EmbeddingJob[];
+};
+
+export type SamplingMode = "balanced" | "diverse";
+
+export type OutlierMethod = "knn" | "lof";
+
+export type SampleSelectionInput = {
+  workspaceId: string;
+  scope: DatasetMapScope;
+  modelId: string;
+  name: string;
+  targetImages?: number | null;
+  targetRatio?: number | null;
+  mode: SamplingMode;
+  removeOutliers: boolean;
+  outlierMethod?: OutlierMethod | null;
+  outlierPct?: number | null;
+  perClassFloor?: number | null;
+  pcaDim?: number | null;
+  seed?: number | null;
+};
+
+export type SampleSelectionSummary = {
+  sampleSet: string;
+  mode: string;
+  selectedImages: number;
+  selectedObjects: number;
+  excludedOutliers: number;
+  saturated: boolean;
+  seed: number;
+  totalImages: number;
+};
+
+export type SampleSet = {
+  id: string;
+  name: string;
+  scope: DatasetMapScope;
+  modelId: string;
+  mode: string;
+  targetImages?: number | null;
+  targetRatio?: number | null;
+  selectedImages: number;
+  selectedObjects: number;
+  excludedOutliers: number;
+  saturated: boolean;
+  createdAt: string;
+};
+
+export type SampleSetMembers = {
+  imageIds: string[];
+  objectIds: string[];
 };

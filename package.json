@@ -1,13 +1,15 @@
 {
   "name": "dataviewer",
   "private": true,
-  "version": "0.1.3",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "tauri:dev:onnx": "tauri dev --features onnx-runtime",
+    "tauri:build:onnx": "tauri build --features onnx-runtime",
     "validate:rfdetr-coco": "python scripts/validate_rfdetr_coco_export.py",
     "validate:yolo-export": "python scripts/validate_yolo_export.py",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml"

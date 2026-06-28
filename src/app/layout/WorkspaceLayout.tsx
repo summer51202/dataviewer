@@ -9,6 +9,7 @@ import { cx } from "../../lib/cx";
 
 const navItems = [
   { to: "browser", label: "Browser" },
+  { to: "dataset-map", label: "Dataset Map" },
   { to: "sources", label: "Sources" },
   { to: "import-review", label: "Import Review" },
   { to: "cvat", label: "CVAT Tasks" },
